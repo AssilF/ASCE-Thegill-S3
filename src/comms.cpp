@@ -10,6 +10,7 @@
 namespace Comms {
 namespace {
 constexpr uint8_t kIdentityStringLength = sizeof(protocol::IdentityMessage::identity);
+constexpr uint32_t kHandshakeCooldownMs = 1000;
 
 bool g_paired = false;
 protocol::ControlMessage g_lastMessage{};
@@ -18,6 +19,8 @@ uint8_t g_controllerMac[6] = {0};
 char g_controllerIdentity[kIdentityStringLength] = {0};
 uint8_t g_channel = 0;
 uint32_t g_lastHandshakeMs = 0;
+DriveCommand g_lastCommand{};
+uint32_t g_syntheticSequence = 0;
 
 bool macIsNonZero(const uint8_t *mac) {
   for (std::size_t i = 0; i < 6; ++i) {
