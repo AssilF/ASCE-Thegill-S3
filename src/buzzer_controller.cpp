@@ -6,6 +6,7 @@ void BuzzerController::begin(uint8_t pin, uint8_t channel, uint8_t resolutionBit
   ledcAttachPin(pin, channel);
   channel_ = channel;
   resolutionBits_ = resolutionBits;
+  ledcWrite(channel_, 0);
 }
 
 void BuzzerController::update() {
@@ -20,6 +21,7 @@ void BuzzerController::update() {
       loadNextStep();
     } else if (pendingPauseMs_ > 0) {
       ledcWriteTone(channel_, 0);
+      ledcWrite(channel_, 0);
       nextChangeMs_ = now + pendingPauseMs_;
       pendingPauseMs_ = 0;
       inPause_ = true;
@@ -46,6 +48,7 @@ void BuzzerController::stop() {
     return;
   }
   ledcWriteTone(channel_, 0);
+  ledcWrite(channel_, 0);
   playing_ = false;
   sequence_ = nullptr;
   currentIndex_ = 0;
@@ -73,8 +76,12 @@ void BuzzerController::loadNextStep() {
   const ToneStep &step = sequence_[currentIndex_++];
   if (step.frequencyHz == 0) {
     ledcWriteTone(channel_, 0);
+    ledcWrite(channel_, 0);
   } else {
     ledcWriteTone(channel_, step.frequencyHz);
+    const uint32_t maxDuty = (1u << resolutionBits_) - 1u;
+    const uint32_t duty = maxDuty > 0 ? ((maxDuty + 1u) / 2u) : 0u;
+    ledcWrite(channel_, duty);
   }
   nextChangeMs_ = millis() + step.durationMs;
 
@@ -82,6 +89,7 @@ void BuzzerController::loadNextStep() {
     pendingPauseMs_ = step.pauseMs;
     if (step.durationMs == 0) {
       ledcWriteTone(channel_, 0);
+      ledcWrite(channel_, 0);
       nextChangeMs_ = millis() + pendingPauseMs_;
       pendingPauseMs_ = 0;
     }
