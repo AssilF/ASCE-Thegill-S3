@@ -45,7 +45,7 @@ void ControlSystem::begin() {
   instance_ = this;
 
   statusLed_.begin(config::kStatusLedPin);
-  statusLed_.setMode(StatusLed::Mode::kBoot);
+  statusLed_.setMode(StatusLed::Mode::kPairing);
 
   for (std::size_t i = 0; i < config::kMotorCount; ++i) {
     motors_[i].begin(config::kMotorPins[i]);
