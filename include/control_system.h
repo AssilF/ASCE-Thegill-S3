@@ -26,6 +26,7 @@ private:
   void handleScanRequest(const uint8_t *mac);
   void handleControllerIdentity(const uint8_t *mac, const protocol::IdentityMessage &message);
   void handleControlPacket(const uint8_t *mac, const protocol::ControlMessage &packet);
+  void handleGillControlPacket(const uint8_t *mac, const protocol::GillControlPacket &packet);
   void ensurePeer(const uint8_t *mac);
   void sendIdentityMessage(const uint8_t *mac, protocol::MessageType type);
   void stopAllMotors();

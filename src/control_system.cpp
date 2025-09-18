@@ -119,6 +119,14 @@ void ControlSystem::onEspNowData(const uint8_t *mac, const uint8_t *data, int le
     }
   }
 
+  if (!handled && len >= static_cast<int>(sizeof(protocol::GillControlPacket))) {
+    const auto &packet = *reinterpret_cast<const protocol::GillControlPacket *>(data);
+    if (packet.magic == protocol::kGillPacketMagic) {
+      handleGillControlPacket(mac, packet);
+      handled = true;
+    }
+  }
+
   if (!handled && len >= static_cast<int>(sizeof(protocol::ControlMessage))) {
     const auto &packet = *reinterpret_cast<const protocol::ControlMessage *>(data);
     if (packet.type == static_cast<uint8_t>(protocol::MessageType::kControlCommand)) {
@@ -203,6 +211,42 @@ void ControlSystem::handleControlPacket(const uint8_t *mac, const protocol::Cont
   updateStatusForConnection();
 
   if (packet.flags & protocol::kControlFlagHonk) {
+    buzzer_.playSequence(kHonkSequence, ToneSequenceLength(kHonkSequence));
+  }
+}
+
+void ControlSystem::handleGillControlPacket(const uint8_t *mac, const protocol::GillControlPacket &packet) {
+  if (packet.magic != protocol::kGillPacketMagic) {
+    Serial.println("Ignoring Thegill packet with invalid magic");
+    return;
+  }
+
+  if (!pairingState_.paired || memcmp(mac, pairingState_.controllerMac, 6) != 0) {
+    Serial.println("Ignoring Thegill packet from unpaired controller");
+    return;
+  }
+
+  lastControlTimestamp_ = millis();
+  exitFailsafe();
+
+  const bool brakeAll = (packet.flags & protocol::kGillFlagBrake) != 0;
+  const bool honk = (packet.flags & protocol::kGillFlagHonk) != 0;
+
+  const int16_t motorValues[] = {packet.leftFront, packet.leftRear, packet.rightFront, packet.rightRear};
+  constexpr std::size_t kGillMotorCount = sizeof(motorValues) / sizeof(motorValues[0]);
+
+  for (std::size_t i = 0; i < config::kMotorCount; ++i) {
+    float command = 0.0f;
+    if (i < kGillMotorCount) {
+      command = static_cast<float>(motorValues[i]) / 1000.0f;
+    }
+    motors_[i].applyCommand(command, brakeAll);
+    lastMotorCommands_[i] = brakeAll ? 0.0f : command;
+  }
+
+  updateStatusForConnection();
+
+  if (honk) {
     buzzer_.playSequence(kHonkSequence, ToneSequenceLength(kHonkSequence));
   }
 }
