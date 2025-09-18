@@ -28,7 +28,7 @@ private:
   void handleControlPacket(const uint8_t *mac, const protocol::ControlMessage &packet);
   void handleGillControlPacket(const uint8_t *mac, const protocol::GillControlPacket &packet);
   void ensurePeer(const uint8_t *mac);
-  void sendIdentityMessage(const uint8_t *mac, protocol::MessageType type);
+  bool sendIdentityMessage(const uint8_t *mac, protocol::MessageType type);
   void stopAllMotors();
   void enterFailsafe();
   void exitFailsafe();
@@ -40,7 +40,9 @@ private:
   BuzzerController buzzer_;
   StatusLed statusLed_;
   PairingState pairingState_;
+  uint8_t selfMac_[6] = {0};
   uint32_t lastControlTimestamp_ = 0;
+  uint32_t lastHandshakeTimestamp_ = 0;
   bool failsafeActive_ = false;
   bool pendingPairingTone_ = false;
   float lastMotorCommands_[config::kMotorCount] = {0};
