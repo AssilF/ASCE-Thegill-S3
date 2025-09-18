@@ -69,8 +69,6 @@ void ControlSystem::begin() {
   statusLed_.setMode(StatusLed::Mode::kPairing);
 
   for (std::size_t i = 0; i < config::kMotorCount; ++i) {
-    Serial.printf("Initializing motor %u on pin %u\n", static_cast<unsigned>(i),
-                  static_cast<unsigned>(config::kMotorPins[i]));
     motors_[i].begin(config::kMotorPins[i]);
     lastMotorCommands_[i] = 0.0f;
   }
