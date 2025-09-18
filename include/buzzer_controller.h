@@ -20,6 +20,7 @@ public:
   void begin(uint8_t pin, uint8_t channel, uint8_t resolutionBits);
   void update();
   void playSequence(const ToneStep *sequence, std::size_t length, bool loop = false);
+  void playBootSequence(bool loop = false);
   void stop();
   bool isPlaying() const;
 
