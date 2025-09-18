@@ -21,6 +21,8 @@ private:
     char controllerName[16] = {0};
   };
 
+uint8_t storedMac[6] = {0x24, 0x6F, 0x28, 0xAA, 0xBB, 0xCC}; // Replace with actual MAC address
+
   static void EspNowReceiveTrampoline(const uint8_t *mac, const uint8_t *data, int len);
 
   void handleScanRequest(const uint8_t *mac);
