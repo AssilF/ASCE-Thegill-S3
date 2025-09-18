@@ -2,7 +2,12 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <math.h>
-
+#include <buzzer_controller.h>
+#include <status_led.h>
+#include <comms.h>
+#include <network_setup.h>
+#include <control_protocol.h>
+#include <control_system.h>
 
 namespace {
 constexpr ToneStep kPairingSequence[] = {

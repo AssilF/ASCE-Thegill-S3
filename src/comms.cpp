@@ -1,6 +1,11 @@
 #include "comms.h"
-
+#include <Arduino.h>
+#include <WiFi.h>
 #include <cstring>
+#include <esp_now.h>
+#include <device_config.h>
+#include <control_protocol.h>
+#include <motor_driver.h>
 
 namespace Comms {
 namespace {
