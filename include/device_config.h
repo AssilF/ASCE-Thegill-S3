@@ -5,7 +5,7 @@
 
 namespace config {
 
-constexpr const char kDeviceIdentity[] = "GillerT12";
+constexpr const char kDeviceIdentity[] = "THEGILL";
 constexpr const char kAccessPointSsid[] = "Thegill PORT";
 constexpr const char kAccessPointPassword[] = "ASCE321#";
 constexpr uint8_t kEspNowChannel = 6;
