@@ -17,6 +17,7 @@ struct MotorPinConfig {
   uint8_t reversePin;
   uint8_t forwardChannel;
   uint8_t reverseChannel;
+  uint8_t timerIndex;
   bool inverted;
 };
 
@@ -31,14 +32,14 @@ constexpr uint32_t kMotorPwmFrequencyHigh = 4000;
 
 constexpr MotorPinConfig kMotorPins[kMotorCount] = {
     // Left side motors share orientation, right side are mirrored and inverted.
-    {16, 15, 0, 1, false},  // Front left motor (H-bridge A1/A2)
-    {18, 17, 2, 3, false},  // Rear left motor (H-bridge B1/B2)
-    {13, 14, 4, 5, true},   // Front right motor (H-bridge C1/C2)
-    {11, 12, 6, 7, true},   // Rear right motor (H-bridge D1/D2)
+    {16, 15, 0, 1, 0, false},  // Front left motor (H-bridge A1/A2)
+    {18, 17, 2, 3, 1, false},  // Rear left motor (H-bridge B1/B2)
+    {13, 14, 4, 5, 2, true},   // Front right motor (H-bridge C1/C2)
+    {11, 12, 6, 7, 3, true},   // Rear right motor (H-bridge D1/D2)
 };
 
 constexpr uint8_t kBuzzerPin = 47;
-constexpr uint8_t kBuzzerChannel = 8;
+constexpr uint8_t kBuzzerChannel = 0;
 constexpr uint8_t kBuzzerResolutionBits = 10;
 
 constexpr uint8_t kPwmResolutionBits = 8;
