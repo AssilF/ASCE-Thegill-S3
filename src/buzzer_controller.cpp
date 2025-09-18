@@ -36,6 +36,10 @@ void BuzzerController::begin(uint8_t pin) {
   requestedFrequencyHz_ = 0;
   currentFrequencyHz_ = 0;
   currentResolutionBits_ = config::kBuzzerResolutionBits;
+
+  pendingGuardStep_ = false;
+  guardReleaseMs_ = 0;
+
 }
 
 void BuzzerController::update() {
@@ -67,6 +71,8 @@ void BuzzerController::playSequence(const ToneStep *sequence, std::size_t length
   playing_ = true;
   inPause_ = false;
   pendingPauseMs_ = 0;
+  pendingGuardStep_ = false;
+  guardReleaseMs_ = 0;
   nextChangeMs_ = millis();
   loadNextStep();
 }
@@ -81,6 +87,8 @@ void BuzzerController::stop() {
   currentIndex_ = 0;
   pendingPauseMs_ = 0;
   inPause_ = false;
+  pendingGuardStep_ = false;
+  guardReleaseMs_ = 0;
 }
 
 bool BuzzerController::isPlaying() const { return playing_; }
@@ -104,13 +112,52 @@ void BuzzerController::loadNextStep() {
     }
   }
 
-  const ToneStep &step = sequence_[currentIndex_++];
+  if (pendingGuardStep_ && guardReleaseMs_ != 0) {
+    const uint32_t nowGuard = millis();
+    if (nowGuard < guardReleaseMs_) {
+      inPause_ = true;
+      nextChangeMs_ = guardReleaseMs_;
+      return;
+    }
+  }
+
+  ToneStep step{};
+  const uint32_t now = millis();
+  if (pendingGuardStep_) {
+    step = guardStep_;
+  } else {
+    step = sequence_[currentIndex_];
+    guardStep_ = step;
+  }
+
+  if (!pendingGuardStep_ && requestedFrequencyHz_ != 0 && step.frequencyHz != 0) {
+    const uint32_t previous = requestedFrequencyHz_;
+    const uint32_t next = step.frequencyHz;
+    const uint32_t delta = (previous > next) ? (previous - next) : (next - previous);
+    const uint32_t maxFrequency = std::max(previous, next);
+    const bool deltaLargeEnough = delta >= config::kBuzzerRetuneGuardMinDeltaHz;
+    const bool ratioLargeEnough =
+        (maxFrequency > 0) && (delta * 100U >= maxFrequency * config::kBuzzerRetuneGuardDeltaPercent);
+    if (deltaLargeEnough && ratioLargeEnough) {
+      stopToneOutput();
+      pendingGuardStep_ = true;
+      guardReleaseMs_ = now + config::kBuzzerRetuneGuardMs;
+      inPause_ = true;
+      nextChangeMs_ = guardReleaseMs_;
+      return;
+    }
+  }
+
+  pendingGuardStep_ = false;
+  guardReleaseMs_ = 0;
+  ++currentIndex_;
+
   if (step.frequencyHz == 0) {
     stopToneOutput();
   } else {
     startTone(step.frequencyHz);
   }
-  nextChangeMs_ = millis() + step.durationMs;
+  nextChangeMs_ = now + step.durationMs;
 
   if (step.pauseMs > 0) {
     pendingPauseMs_ = step.pauseMs;
