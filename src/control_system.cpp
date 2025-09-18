@@ -35,6 +35,8 @@ constexpr ToneStep kFailsafeSequence[] = {
     {0, 120, 0},
     {220, 180, 0},
 };
+
+constexpr uint32_t kHandshakeCooldownMs = 500;
 } // namespace
 
 ControlSystem *ControlSystem::instance_ = nullptr;
@@ -55,6 +57,8 @@ void ControlSystem::begin() {
 
   ConfigureWiFi(config::kDeviceIdentity, config::kAccessPointSsid, config::kAccessPointPassword,
                 config::kEspNowChannel);
+  WiFi.macAddress(selfMac_);
+  lastHandshakeTimestamp_ = 0;
   if (!InitializeEspNow(&ControlSystem::EspNowReceiveTrampoline)) {
     Serial.println("ESP-NOW callback registration failed");
   }
@@ -142,35 +146,62 @@ void ControlSystem::EspNowReceiveTrampoline(const uint8_t *mac, const uint8_t *d
 }
 
 void ControlSystem::handleScanRequest(const uint8_t *mac) {
+  const uint32_t now = millis();
+  if (now - lastHandshakeTimestamp_ < kHandshakeCooldownMs) {
+    return;
+  }
+
   Serial.printf("Discovery scan from %02X:%02X:%02X:%02X:%02X:%02X\n", mac[0], mac[1], mac[2], mac[3], mac[4],
                 mac[5]);
-  sendIdentityMessage(mac, protocol::MessageType::kDroneIdentity);
+  if (sendIdentityMessage(mac, protocol::MessageType::kDroneIdentity)) {
+    lastHandshakeTimestamp_ = now;
+  }
 }
 
 void ControlSystem::handleControllerIdentity(const uint8_t *mac,
                                              const protocol::IdentityMessage &message) {
-  const bool sameController = pairingState_.paired && memcmp(mac, pairingState_.controllerMac, 6) == 0;
+  const uint32_t now = millis();
+
+  bool payloadMacValid = false;
+  for (std::size_t i = 0; i < sizeof(message.mac); ++i) {
+    if (message.mac[i] != 0) {
+      payloadMacValid = true;
+      break;
+    }
+  }
+
+  const bool macMatchesSender = payloadMacValid && memcmp(message.mac, mac, 6) == 0;
+  const uint8_t *storedMac = macMatchesSender ? message.mac : mac;
+  const uint8_t *ackMac = payloadMacValid ? message.mac : mac;
+  const bool sameController = pairingState_.paired && memcmp(pairingState_.controllerMac, storedMac, 6) == 0;
 
   if (!sameController) {
-    memcpy(pairingState_.controllerMac, mac, 6);
+    memcpy(pairingState_.controllerMac, storedMac, 6);
     strlcpy(pairingState_.controllerName, message.identity, sizeof(pairingState_.controllerName));
     pairingState_.paired = true;
-    lastControlTimestamp_ = millis();
+    lastControlTimestamp_ = now;
     pendingPairingTone_ = false;
     exitFailsafe();
     stopAllMotors();
+    ensurePeer(storedMac);
     Serial.printf("Paired with controller %s (%02X:%02X:%02X:%02X:%02X:%02X)\n", pairingState_.controllerName,
-                  mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+                  storedMac[0], storedMac[1], storedMac[2], storedMac[3], storedMac[4], storedMac[5]);
     buzzer_.playSequence(kConnectedSequence, ToneSequenceLength(kConnectedSequence));
     updateStatusForConnection();
   } else {
     if (strncmp(pairingState_.controllerName, message.identity, sizeof(pairingState_.controllerName)) != 0) {
       strlcpy(pairingState_.controllerName, message.identity, sizeof(pairingState_.controllerName));
     }
-    lastControlTimestamp_ = millis();
+    lastControlTimestamp_ = now;
   }
 
-  sendIdentityMessage(mac, protocol::MessageType::kDroneAck);
+  if (payloadMacValid && !macMatchesSender) {
+    Serial.println("Controller identity MAC mismatch between payload and sender");
+  }
+
+  if (sendIdentityMessage(ackMac, protocol::MessageType::kDroneAck)) {
+    lastHandshakeTimestamp_ = now;
+  }
 }
 
 void ControlSystem::handleControlPacket(const uint8_t *mac, const protocol::ControlMessage &packet) {
@@ -266,15 +297,17 @@ void ControlSystem::ensurePeer(const uint8_t *mac) {
   }
 }
 
-void ControlSystem::sendIdentityMessage(const uint8_t *mac, protocol::MessageType type) {
+bool ControlSystem::sendIdentityMessage(const uint8_t *mac, protocol::MessageType type) {
   protocol::IdentityMessage message{};
   message.type = static_cast<uint8_t>(type);
   strlcpy(message.identity, config::kDeviceIdentity, sizeof(message.identity));
-  WiFi.macAddress(message.mac);
+  memcpy(message.mac, selfMac_, sizeof(selfMac_));
   ensurePeer(mac);
   if (esp_now_send(mac, reinterpret_cast<uint8_t *>(&message), sizeof(message)) != ESP_OK) {
     Serial.println("Failed to send identity message");
+    return false;
   }
+  return true;
 }
 
 void ControlSystem::stopAllMotors() {
