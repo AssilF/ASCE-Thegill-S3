@@ -54,7 +54,7 @@ void ControlSystem::begin() {
   if (!Comms::init(config::kAccessPointSsid, config::kAccessPointPassword, config::kEspNowChannel)) {
     Serial.println("Failed to initialize communications");
   }
-
+  
   WiFi.softAPmacAddress(selfMac_);
   Serial.printf("SoftAP MAC address %02X:%02X:%02X:%02X:%02X:%02X\n", selfMac_[0], selfMac_[1], selfMac_[2],
                 selfMac_[3], selfMac_[4], selfMac_[5]);
@@ -80,7 +80,7 @@ void ControlSystem::begin() {
     }
   }
 
-  pendingPairingTone_ = true;
+  pendingPairingTone_ = false;
   paired_ = false;
   failsafeActive_ = false;
   lastCommandTimestamp_ = 0;
@@ -118,8 +118,8 @@ void ControlSystem::updateTask() {
       paired_ = true;
       pendingPairingTone_ = false;
       stopAllMotors();
-      const uint8_t *mac = Comms::BroadcastMac;
-      const char *identity = Comms::DRONE_IDENTITY;
+      const uint8_t *mac = Comms::controllerMac();
+      const char *identity = Comms::controllerIdentity();
       Serial.printf("Paired with controller %s (%02X:%02X:%02X:%02X:%02X:%02X)\n",
                     (identity != nullptr) ? identity : "",
                     mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
@@ -222,7 +222,7 @@ void ControlSystem::updateDriveIndicator() {
 }
 
 void ControlSystem::updateStatusForPairing() {
-  statusLed_.setMode(StatusLed::Mode::kPairing);
+  statusLed_.setMode(StatusLed::Mode::kFailsafe);
   statusLed_.setDriveBalance(0.0f, 0.0f);
 }
 
