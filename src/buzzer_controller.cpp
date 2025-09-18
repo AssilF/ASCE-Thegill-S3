@@ -2,9 +2,9 @@
 
 namespace {
 constexpr ToneStep kDefaultBootSequence[] = {
-    {784, 200, 30},  // G5
-    {988, 160, 30},  // B5
-    {1568, 180, 0},  // G6
+    {784, 784, 784},  // G5
+    {988, 988, 988},  // B5
+    {1568, 1568, 1568},  // G6
 };
 } // namespace
 

@@ -13,24 +13,23 @@
 
 namespace {
 constexpr ToneStep kPairingSequence[] = {
-    {1319, 120, 20}, // E6
-    {1760, 120, 0},  // A6
+    {500, 4000, 2000}, // E6
+    {4000, 2000, 3000},  // A6
 };
 
 constexpr ToneStep kConnectedSequence[] = {
-    {880, 120, 10}, // A5
-    {1175, 200, 0}, // D6
+    {500, 4000, 2000}, // E6
+    {4000, 2000, 3000},  // A6
 };
 
 constexpr ToneStep kHonkSequence[] = {
-    {392, 300, 20}, // G4
-    {311, 300, 0},  // D#4
+    {500, 4000, 2000}, // E6
+    {4000, 2000, 3000},  // A6
 };
 
 constexpr ToneStep kFailsafeSequence[] = {
-    {220, 180, 20}, // A3
-    {0, 120, 0},
-    {220, 180, 0},
+    {500, 4000, 2000}, // E6
+    {4000, 2000, 3000},  // A6
 };
 
 constexpr uint32_t kHandshakeCooldownMs = 500;
