@@ -31,6 +31,23 @@ constexpr ToneStep kFailsafeSequence[] = {
 };
 
 constexpr uint32_t kHandshakeCooldownMs = 500;
+
+const char *MessageTypeName(protocol::MessageType type) {
+  switch (type) {
+  case protocol::MessageType::kScanRequest:
+    return "scan request";
+  case protocol::MessageType::kDroneIdentity:
+    return "drone identity";
+  case protocol::MessageType::kControllerIdentity:
+    return "controller identity";
+  case protocol::MessageType::kDroneAck:
+    return "drone ack";
+  case protocol::MessageType::kControlCommand:
+    return "control command";
+  default:
+    return "unknown";
+  }
+}
 } // namespace
 
 ControlSystem *ControlSystem::instance_ = nullptr;
@@ -38,10 +55,13 @@ ControlSystem *ControlSystem::instance_ = nullptr;
 void ControlSystem::begin() {
   instance_ = this;
 
+  Serial.println("ControlSystem initialization started");
   statusLed_.begin(config::kStatusLedPin);
   statusLed_.setMode(StatusLed::Mode::kPairing);
 
   for (std::size_t i = 0; i < config::kMotorCount; ++i) {
+    Serial.printf("Initializing motor %u on pin %u\n", static_cast<unsigned>(i),
+                  static_cast<unsigned>(config::kMotorPins[i]));
     motors_[i].begin(config::kMotorPins[i]);
     lastMotorCommands_[i] = 0.0f;
   }
@@ -52,6 +72,8 @@ void ControlSystem::begin() {
   ConfigureWiFi(config::kDeviceIdentity, config::kAccessPointSsid, config::kAccessPointPassword,
                 config::kEspNowChannel);
   WiFi.softAPmacAddress(selfMac_);
+  Serial.printf("SoftAP MAC address %02X:%02X:%02X:%02X:%02X:%02X\n", selfMac_[0], selfMac_[1], selfMac_[2],
+                selfMac_[3], selfMac_[4], selfMac_[5]);
   lastHandshakeTimestamp_ = 0;
   if (!InitializeEspNow(&ControlSystem::EspNowReceiveTrampoline)) {
     Serial.println("ESP-NOW callback registration failed");
@@ -70,6 +92,7 @@ void ControlSystem::begin() {
       [](ota_error_t error) { Serial.printf("OTA Error[%u]\n", error); });
 
   pendingPairingTone_ = true;
+  Serial.println("Pairing tone scheduled");
   updateStatusForPairing();
   failsafeActive_ = false;
   pairingState_ = PairingState{};
@@ -96,9 +119,14 @@ void ControlSystem::loop() {
 void ControlSystem::onEspNowData(const uint8_t *mac, const uint8_t *data, int len) {
   bool handled = false;
 
+  Serial.printf("ESP-NOW packet (%d bytes) from %02X:%02X:%02X:%02X:%02X:%02X\n", len, mac[0], mac[1], mac[2], mac[3],
+                mac[4], mac[5]);
+
   if (len == static_cast<int>(sizeof(protocol::IdentityMessage))) {
     const auto &message = *reinterpret_cast<const protocol::IdentityMessage *>(data);
     const protocol::MessageType type = static_cast<protocol::MessageType>(message.type);
+    Serial.printf("Identity payload detected: type=%s (%u) senderName=%s\n", MessageTypeName(type),
+                  static_cast<unsigned>(message.type), message.identity);
     switch (type) {
     case protocol::MessageType::kScanRequest:
       handleScanRequest(mac);
@@ -120,6 +148,7 @@ void ControlSystem::onEspNowData(const uint8_t *mac, const uint8_t *data, int le
   if (!handled && len >= static_cast<int>(sizeof(protocol::GillControlPacket))) {
     const auto &packet = *reinterpret_cast<const protocol::GillControlPacket *>(data);
     if (packet.magic == protocol::kGillPacketMagic) {
+      Serial.println("Gill control packet received");
       handleGillControlPacket(mac, packet);
       handled = true;
     }
@@ -128,6 +157,7 @@ void ControlSystem::onEspNowData(const uint8_t *mac, const uint8_t *data, int le
   if (!handled && len >= static_cast<int>(sizeof(protocol::ControlMessage))) {
     const auto &packet = *reinterpret_cast<const protocol::ControlMessage *>(data);
     if (packet.type == static_cast<uint8_t>(protocol::MessageType::kControlCommand)) {
+      Serial.println("ILITE control packet received");
       handleControlPacket(mac, packet);
     }
   }
@@ -142,12 +172,17 @@ void ControlSystem::EspNowReceiveTrampoline(const uint8_t *mac, const uint8_t *d
 void ControlSystem::handleScanRequest(const uint8_t *mac) {
   const uint32_t now = millis();
   if (now - lastHandshakeTimestamp_ < kHandshakeCooldownMs) {
+    Serial.printf(
+        "Ignoring scan request from %02X:%02X:%02X:%02X:%02X:%02X due to cooldown (%lu ms since last handshake)\n",
+        mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
+        static_cast<unsigned long>(now - lastHandshakeTimestamp_));
     return;
   }
 
   Serial.printf("Discovery scan from %02X:%02X:%02X:%02X:%02X:%02X\n", mac[0], mac[1], mac[2], mac[3], mac[4],
                 mac[5]);
   if (sendIdentityMessage(mac, protocol::MessageType::kDroneIdentity)) {
+    Serial.println("Drone identity response sent");
     lastHandshakeTimestamp_ = now;
   }
 }
@@ -166,6 +201,10 @@ void ControlSystem::handleControllerIdentity(const uint8_t *mac,
 
 
   const bool addressedToUs = payloadMacValid && memcmp(message.mac, selfMac_, sizeof(selfMac_)) == 0;
+  Serial.printf(
+      "Controller identity from %02X:%02X:%02X:%02X:%02X:%02X name=%s payloadMac=%02X:%02X:%02X:%02X:%02X:%02X addressedToUs=%s\n",
+      mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], message.identity, message.mac[0], message.mac[1],
+      message.mac[2], message.mac[3], message.mac[4], message.mac[5], addressedToUs ? "yes" : "no");
   if (payloadMacValid && !addressedToUs) {
     Serial.println("Controller identity payload MAC does not match this drone");
   }
@@ -189,14 +228,17 @@ void ControlSystem::handleControllerIdentity(const uint8_t *mac,
     updateStatusForConnection();
   } else {
     if (strncmp(pairingState_.controllerName, message.identity, sizeof(pairingState_.controllerName)) != 0) {
+      Serial.printf("Controller %02X:%02X:%02X:%02X:%02X:%02X updated name to %s\n", mac[0], mac[1], mac[2], mac[3],
+                    mac[4], mac[5], message.identity);
       strlcpy(pairingState_.controllerName, message.identity, sizeof(pairingState_.controllerName));
     }
     lastControlTimestamp_ = now;
+    Serial.println("Refreshed pairing timestamp for existing controller");
   }
 
 
   if (sendIdentityMessage(mac, protocol::MessageType::kDroneAck)) {
-
+    Serial.println("Sent drone acknowledgement to controller");
     lastHandshakeTimestamp_ = now;
   }
 }
@@ -208,10 +250,13 @@ void ControlSystem::handleControlPacket(const uint8_t *mac, const protocol::Cont
   }
 
   if (!pairingState_.paired || memcmp(mac, pairingState_.controllerMac, 6) != 0) {
-    Serial.println("Ignoring control packet from unpaired controller");
+    Serial.printf("Ignoring control packet from unpaired controller %02X:%02X:%02X:%02X:%02X:%02X\n", mac[0], mac[1],
+                  mac[2], mac[3], mac[4], mac[5]);
     return;
   }
 
+  Serial.printf("Applying control packet seq=%lu flags=0x%04X\n", static_cast<unsigned long>(packet.sequence),
+                packet.flags);
   lastControlTimestamp_ = millis();
   exitFailsafe();
 
@@ -250,10 +295,13 @@ void ControlSystem::handleGillControlPacket(const uint8_t *mac, const protocol::
   }
 
   if (!pairingState_.paired || memcmp(mac, pairingState_.controllerMac, 6) != 0) {
-    Serial.println("Ignoring Thegill packet from unpaired controller");
+    Serial.printf("Ignoring Thegill packet from unpaired controller %02X:%02X:%02X:%02X:%02X:%02X\n", mac[0], mac[1],
+                  mac[2], mac[3], mac[4], mac[5]);
     return;
   }
 
+  Serial.printf("Applying Gill packet flags=0x%02X mode=%u easing=%u rate=%.3f\n", packet.flags, packet.mode,
+                packet.easing, static_cast<double>(packet.easingRate));
   lastControlTimestamp_ = millis();
   exitFailsafe();
 
@@ -281,6 +329,8 @@ void ControlSystem::handleGillControlPacket(const uint8_t *mac, const protocol::
 
 void ControlSystem::ensurePeer(const uint8_t *mac) {
   if (esp_now_is_peer_exist(mac)) {
+    Serial.printf("ESP-NOW peer already exists for %02X:%02X:%02X:%02X:%02X:%02X\n", mac[0], mac[1], mac[2], mac[3],
+                  mac[4], mac[5]);
     return;
   }
 
@@ -291,6 +341,9 @@ void ControlSystem::ensurePeer(const uint8_t *mac) {
   peerInfo.ifidx = WIFI_IF_AP;
   if (esp_now_add_peer(&peerInfo) != ESP_OK) {
     Serial.println("Failed to add ESP-NOW peer");
+  } else {
+    Serial.printf("Added ESP-NOW peer %02X:%02X:%02X:%02X:%02X:%02X\n", mac[0], mac[1], mac[2], mac[3], mac[4],
+                  mac[5]);
   }
 }
 
@@ -304,10 +357,13 @@ bool ControlSystem::sendIdentityMessage(const uint8_t *mac, protocol::MessageTyp
     Serial.println("Failed to send identity message");
     return false;
   }
+  Serial.printf("Sent %s message to %02X:%02X:%02X:%02X:%02X:%02X\n", MessageTypeName(type), mac[0], mac[1], mac[2],
+                mac[3], mac[4], mac[5]);
   return true;
 }
 
 void ControlSystem::stopAllMotors() {
+  Serial.println("Stopping all motors");
   for (std::size_t i = 0; i < config::kMotorCount; ++i) {
     motors_[i].stop();
     lastMotorCommands_[i] = 0.0f;
@@ -319,6 +375,7 @@ void ControlSystem::enterFailsafe() {
   if (failsafeActive_) {
     return;
   }
+  Serial.println("Entering failsafe mode");
   stopAllMotors();
   buzzer_.playSequence(kFailsafeSequence, ToneSequenceLength(kFailsafeSequence));
   failsafeActive_ = true;
@@ -329,6 +386,7 @@ void ControlSystem::exitFailsafe() {
   if (!failsafeActive_) {
     return;
   }
+  Serial.println("Exiting failsafe mode");
   failsafeActive_ = false;
   buzzer_.stop();
   if (pairingState_.paired) {
@@ -358,11 +416,13 @@ void ControlSystem::updateDriveIndicator() {
 }
 
 void ControlSystem::updateStatusForPairing() {
+  Serial.println("Status LED set for pairing mode");
   statusLed_.setMode(StatusLed::Mode::kPairing);
   statusLed_.setDriveBalance(0.0f, 0.0f);
 }
 
 void ControlSystem::updateStatusForConnection() {
+  Serial.println("Status LED set for connected mode");
   statusLed_.setMode(StatusLed::Mode::kConnected);
   updateDriveIndicator();
 }
