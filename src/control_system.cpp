@@ -3,6 +3,9 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <esp_now.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/queue.h>
+#include <freertos/task.h>
 #include <math.h>
 #include <string.h>
 
@@ -31,6 +34,12 @@ constexpr ToneStep kFailsafeSequence[] = {
 };
 
 constexpr uint32_t kHandshakeCooldownMs = 500;
+constexpr UBaseType_t kEspNowTaskPriority = 3;
+constexpr UBaseType_t kUpdateTaskPriority = 2;
+constexpr std::size_t kEspNowQueueLength = 10;
+constexpr uint32_t kEspNowTaskStackWords = 4096;
+constexpr uint32_t kUpdateTaskStackWords = 4096;
+constexpr TickType_t kUpdateTaskDelayTicks = pdMS_TO_TICKS(10);
 
 const char *MessageTypeName(protocol::MessageType type) {
   switch (type) {
@@ -66,7 +75,7 @@ void ControlSystem::begin() {
     lastMotorCommands_[i] = 0.0f;
   }
 
-  buzzer_.begin(config::kBuzzerPin, config::kBuzzerChannel, config::kBuzzerResolutionBits);
+  buzzer_.begin(config::kBuzzerPin);
   buzzer_.playBootSequence();
 
   ConfigureWiFi(config::kDeviceIdentity, config::kAccessPointSsid, config::kAccessPointPassword,
@@ -91,6 +100,32 @@ void ControlSystem::begin() {
       },
       [](ota_error_t error) { Serial.printf("OTA Error[%u]\n", error); });
 
+  if (espNowQueue_ == nullptr) {
+    espNowQueue_ = xQueueCreate(kEspNowQueueLength, sizeof(EspNowPacket));
+    if (espNowQueue_ == nullptr) {
+      Serial.println("Failed to allocate ESP-NOW queue");
+    }
+  }
+
+  if (espNowQueue_ != nullptr && espNowTaskHandle_ == nullptr) {
+    BaseType_t result = xTaskCreate(EspNowTaskTrampoline, "ESPNowRx", kEspNowTaskStackWords, this,
+                                    kEspNowTaskPriority, &espNowTaskHandle_);
+    if (result != pdPASS) {
+      Serial.println("Failed to create ESP-NOW processing task");
+      espNowTaskHandle_ = nullptr;
+    }
+  }
+
+  if (updateTaskHandle_ == nullptr) {
+    BaseType_t result =
+        xTaskCreate(UpdateTaskTrampoline, "ControlUpdate", kUpdateTaskStackWords, this, kUpdateTaskPriority,
+                    &updateTaskHandle_);
+    if (result != pdPASS) {
+      Serial.println("Failed to create control update task");
+      updateTaskHandle_ = nullptr;
+    }
+  }
+
   pendingPairingTone_ = true;
   Serial.println("Pairing tone scheduled");
   updateStatusForPairing();
@@ -99,22 +134,7 @@ void ControlSystem::begin() {
   lastControlTimestamp_ = 0;
 }
 
-void ControlSystem::loop() {
-  buzzer_.update();
-  statusLed_.update();
-
-  if (pendingPairingTone_ && !buzzer_.isPlaying()) {
-    buzzer_.playSequence(kPairingSequence, ToneSequenceLength(kPairingSequence));
-    pendingPairingTone_ = false;
-  }
-
-  HandleOtaLoop();
-
-  const uint32_t now = millis();
-  if (pairingState_.paired && (now - lastControlTimestamp_ > config::kControlTimeoutMs)) {
-    enterFailsafe();
-  }
-}
+void ControlSystem::loop() { vTaskDelay(kUpdateTaskDelayTicks); }
 
 void ControlSystem::onEspNowData(const uint8_t *mac, const uint8_t *data, int len) {
   bool handled = false;
@@ -165,7 +185,94 @@ void ControlSystem::onEspNowData(const uint8_t *mac, const uint8_t *data, int le
 
 void ControlSystem::EspNowReceiveTrampoline(const uint8_t *mac, const uint8_t *data, int len) {
   if (instance_ != nullptr) {
-    instance_->onEspNowData(mac, data, len);
+    instance_->enqueueEspNowPacketFromIsr(mac, data, len);
+  }
+}
+
+void ControlSystem::EspNowTaskTrampoline(void *param) {
+  auto *self = static_cast<ControlSystem *>(param);
+  if (self != nullptr) {
+    self->espNowTask();
+  }
+  vTaskDelete(nullptr);
+}
+
+void ControlSystem::UpdateTaskTrampoline(void *param) {
+  auto *self = static_cast<ControlSystem *>(param);
+  if (self != nullptr) {
+    self->updateTask();
+  }
+  vTaskDelete(nullptr);
+}
+
+void ControlSystem::enqueueEspNowPacketFromIsr(const uint8_t *mac, const uint8_t *data, int len) {
+  if (len < 0) {
+    return;
+  }
+
+  if (espNowQueue_ == nullptr) {
+    droppedPacketCount_.fetch_add(1, std::memory_order_relaxed);
+    return;
+  }
+
+  EspNowPacket packet{};
+  memcpy(packet.mac, mac, sizeof(packet.mac));
+  uint16_t copyLength = static_cast<uint16_t>(len);
+  if (copyLength > ESP_NOW_MAX_DATA_LEN) {
+    copyLength = ESP_NOW_MAX_DATA_LEN;
+    droppedPacketCount_.fetch_add(1, std::memory_order_relaxed);
+  }
+  if (copyLength > 0 && data != nullptr) {
+    memcpy(packet.payload, data, copyLength);
+  }
+  packet.length = copyLength;
+
+  BaseType_t higherPriorityTaskWoken = pdFALSE;
+  BaseType_t result = xQueueSendFromISR(espNowQueue_, &packet, &higherPriorityTaskWoken);
+  if (result != pdTRUE) {
+    droppedPacketCount_.fetch_add(1, std::memory_order_relaxed);
+  }
+  if (higherPriorityTaskWoken == pdTRUE) {
+    portYIELD_FROM_ISR();
+  }
+}
+
+void ControlSystem::espNowTask() {
+  EspNowPacket packet{};
+  while (true) {
+    if (espNowQueue_ == nullptr) {
+      vTaskDelay(pdMS_TO_TICKS(50));
+      continue;
+    }
+    if (xQueueReceive(espNowQueue_, &packet, portMAX_DELAY) == pdTRUE) {
+      onEspNowData(packet.mac, packet.payload, static_cast<int>(packet.length));
+    }
+  }
+}
+
+void ControlSystem::updateTask() {
+  while (true) {
+    buzzer_.update();
+    statusLed_.update();
+
+    if (pendingPairingTone_ && !buzzer_.isPlaying()) {
+      buzzer_.playSequence(kPairingSequence, ToneSequenceLength(kPairingSequence));
+      pendingPairingTone_ = false;
+    }
+
+    HandleOtaLoop();
+
+    const uint32_t now = millis();
+    if (pairingState_.paired && (now - lastControlTimestamp_ > config::kControlTimeoutMs)) {
+      enterFailsafe();
+    }
+
+    const uint32_t dropped = droppedPacketCount_.exchange(0, std::memory_order_relaxed);
+    if (dropped != 0) {
+      Serial.printf("Dropped %lu ESP-NOW packets\n", static_cast<unsigned long>(dropped));
+    }
+
+    vTaskDelay(kUpdateTaskDelayTicks);
   }
 }
 

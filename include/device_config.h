@@ -8,7 +8,7 @@ namespace config {
 constexpr const char kDeviceIdentity[] = "Thegiller-PT12";
 constexpr const char kAccessPointSsid[] = "Thegill PORT";
 constexpr const char kAccessPointPassword[] = "ASCE321#";
-constexpr uint8_t kEspNowChannel = 1;
+constexpr uint8_t kEspNowChannel = 6;
 constexpr std::size_t kMotorCount = 4;
 constexpr uint32_t kControlTimeoutMs = 500;
 
@@ -38,8 +38,6 @@ constexpr MotorPinConfig kMotorPins[kMotorCount] = {
 };
 
 constexpr uint8_t kBuzzerPin = 47;
-constexpr uint8_t kBuzzerChannel = 14;
-constexpr uint8_t kBuzzerResolutionBits = 12;
 
 constexpr uint8_t kPwmResolutionBits = 8;
 constexpr uint16_t kPwmMaxDuty = (1U << kPwmResolutionBits) - 1U;
