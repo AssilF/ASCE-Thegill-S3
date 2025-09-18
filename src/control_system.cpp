@@ -57,7 +57,7 @@ void ControlSystem::begin() {
 
   ConfigureWiFi(config::kDeviceIdentity, config::kAccessPointSsid, config::kAccessPointPassword,
                 config::kEspNowChannel);
-  WiFi.macAddress(selfMac_);
+  WiFi.softAPmacAddress(selfMac_);
   lastHandshakeTimestamp_ = 0;
   if (!InitializeEspNow(&ControlSystem::EspNowReceiveTrampoline)) {
     Serial.println("ESP-NOW callback registration failed");
@@ -180,7 +180,7 @@ void ControlSystem::handleControllerIdentity(const uint8_t *mac,
 
 
   if (!sameController) {
-    memcpy(pairingState_.controllerMac, storedMac, 6);
+    memcpy(pairingState_.controllerMac, mac, 6);
     strlcpy(pairingState_.controllerName, message.identity, sizeof(pairingState_.controllerName));
     pairingState_.paired = true;
     lastControlTimestamp_ = now;
@@ -292,9 +292,9 @@ void ControlSystem::ensurePeer(const uint8_t *mac) {
 
   esp_now_peer_info_t peerInfo{};
   memcpy(peerInfo.peer_addr, mac, 6);
-  peerInfo.channel = 0;
+  peerInfo.channel = config::kEspNowChannel;
   peerInfo.encrypt = false;
-  peerInfo.ifidx = WIFI_IF_STA;
+  peerInfo.ifidx = WIFI_IF_AP;
   if (esp_now_add_peer(&peerInfo) != ESP_OK) {
     Serial.println("Failed to add ESP-NOW peer");
   }
