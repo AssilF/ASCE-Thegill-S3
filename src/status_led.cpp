@@ -1,6 +1,7 @@
 #include "status_led.h"
 
 #include <Arduino.h>
+#include <algorithm>
 #include <math.h>
 
 StatusLed::StatusLed() : pixel_(1, -1, NEO_GRB + NEO_KHZ800) {}
@@ -27,32 +28,66 @@ void StatusLed::setDriveBalance(float leftIntensity, float rightIntensity) {
 
 void StatusLed::update() {
   const uint32_t now = millis();
+  const uint32_t elapsed = now - modeChangeMs_;
+
   switch (mode_) {
   case Mode::kBoot: {
-    float phase = fmodf(static_cast<float>(now - modeChangeMs_), 2000.0f) / 2000.0f;
-    float brightness = 0.3f + 0.7f * (0.5f - 0.5f * cosf(phase * 2.0f * PI));
-    showColor(0, 0, static_cast<uint8_t>(brightness * 255.0f));
+    const uint32_t cycle = 2800;
+    const uint32_t t = elapsed % cycle;
+    if (t < 700) {
+      const float progress = static_cast<float>(t) / 700.0f;
+      const uint8_t blue = static_cast<uint8_t>(80.0f + 175.0f * progress);
+      const uint8_t green = static_cast<uint8_t>(20.0f + 100.0f * progress);
+      showColor(0, green, blue);
+    } else if (t < 1400) {
+      const float progress = static_cast<float>(t - 700) / 700.0f;
+      const float pulse = 0.5f + 0.5f * sinf(progress * PI);
+      showColor(static_cast<uint8_t>(40.0f * pulse), static_cast<uint8_t>(80.0f + 120.0f * pulse),
+                static_cast<uint8_t>(100.0f + 120.0f * pulse));
+    } else if (t < 2000) {
+      const float progress = static_cast<float>(t - 1400) / 600.0f;
+      const float intensity = 1.0f - fabsf(2.0f * progress - 1.0f);
+      const uint8_t value = static_cast<uint8_t>(180.0f + 75.0f * intensity);
+      showColor(value, value, value);
+    } else {
+      float progress = static_cast<float>(t - 2000) / 800.0f;
+      progress = constrain(progress, 0.0f, 1.0f);
+      const uint8_t red = static_cast<uint8_t>(120.0f + 135.0f * progress);
+      const uint8_t green = static_cast<uint8_t>(25.0f * (1.0f - progress));
+      const uint8_t blue = static_cast<uint8_t>(30.0f * (1.0f - progress));
+      showColor(red, green, blue);
+    }
     break;
   }
   case Mode::kPairing: {
-    float phase = fmodf(static_cast<float>(now - modeChangeMs_), 1500.0f) / 1500.0f;
-    float brightness = 0.2f + 0.8f * fabsf(sinf(phase * PI));
-    showColor(static_cast<uint8_t>(brightness * 40.0f), static_cast<uint8_t>(brightness * 200.0f),
-              static_cast<uint8_t>(brightness * 120.0f));
+    const float sweepPhase = fmodf(static_cast<float>(elapsed), 1100.0f) / 1100.0f;
+    const float sweep = 0.5f + 0.5f * sinf(sweepPhase * 2.0f * PI);
+    const float sparkle = 0.5f + 0.5f * sinf(static_cast<float>(elapsed % 220) / 220.0f * 2.0f * PI);
+    const uint8_t red = static_cast<uint8_t>(60.0f + 160.0f * sweep);
+    const uint8_t green = static_cast<uint8_t>(40.0f + 80.0f * sparkle);
+    const uint8_t blue = static_cast<uint8_t>(90.0f + 130.0f * (1.0f - sweep));
+    showColor(red, green, blue);
     break;
   }
   case Mode::kConnected: {
-    const float left = leftIntensity_;
-    const float right = rightIntensity_;
-    const uint8_t red = static_cast<uint8_t>(constrain(right, 0.0f, 1.0f) * 255.0f);
-    const uint8_t green = static_cast<uint8_t>(constrain(left, 0.0f, 1.0f) * 255.0f);
-    const uint8_t blue = (left < 0.05f && right < 0.05f) ? 30 : 0;
+    const float left = constrain(leftIntensity_, 0.0f, 1.0f);
+    const float right = constrain(rightIntensity_, 0.0f, 1.0f);
+    const float thrust = constrain((left + right) * 0.5f, 0.0f, 1.0f);
+    const float difference = constrain(right - left, -1.0f, 1.0f);
+    const float accent = 0.5f + 0.5f * sinf(static_cast<float>(elapsed % 1400) / 1400.0f * 2.0f * PI);
+    const uint8_t red = static_cast<uint8_t>(80.0f + 140.0f * std::max(difference, 0.0f) + 60.0f * thrust * accent);
+    const uint8_t green = static_cast<uint8_t>(80.0f + 140.0f * std::max(-difference, 0.0f) + 60.0f * thrust * accent);
+    const uint8_t blue = static_cast<uint8_t>(30.0f + 100.0f * (1.0f - thrust) * accent);
     showColor(red, green, blue);
     break;
   }
   case Mode::kFailsafe: {
-    bool on = ((now - modeChangeMs_) / 200) % 2 == 0;
-    showColor(on ? 255 : 0, 0, 0);
+    const uint32_t cycle = 900;
+    const uint32_t t = elapsed % cycle;
+    const bool on = (t < 150) || (t >= 240 && t < 390);
+    const uint8_t red = on ? 255 : 40;
+    const uint8_t blue = on ? 50 : 0;
+    showColor(red, 0, blue);
     break;
   }
   }

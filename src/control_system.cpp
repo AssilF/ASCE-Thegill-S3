@@ -2,6 +2,9 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <math.h>
+#ifdef ARDUINO_ARCH_ESP32
+#include <sdkconfig.h>
+#endif
 #include <buzzer_controller.h>
 #include <status_led.h>
 #include <comms.h>
@@ -11,35 +14,47 @@
 
 namespace {
 constexpr ToneStep kPairingSequence[] = {
-    {500, 4000, 2000}, // E6
-    {4000, 2000, 3000},  // A6
+    {523, 160, 30},   // C5
+    {0, 60, 0},
+    {659, 200, 30},   // E5
+    {0, 60, 0},
+    {784, 260, 120},  // G5
 };
 
 constexpr ToneStep kConnectedSequence[] = {
-    {500, 4000, 2000}, // E6
-    {4000, 2000, 3000},  // A6
+    {784, 160, 20},   // G5
+    {988, 160, 30},   // B5
+    {1175, 240, 160}, // D6
 };
 
 constexpr ToneStep kHonkSequence[] = {
-    {500, 4000, 2000}, // E6
-    {4000, 2000, 3000},  // A6
+    {330, 280, 20},  // E4
+    {262, 180, 20},  // C4
+    {415, 360, 160}, // G#4
 };
 
 constexpr ToneStep kFailsafeSequence[] = {
-    {500, 4000, 2000}, // E6
-    {4000, 2000, 3000},  // A6
+    {880, 200, 20},  // A5
+    {698, 220, 20},  // F5
+    {523, 420, 200}, // C5
 };
 
 constexpr UBaseType_t kUpdateTaskPriority = 2;
 constexpr uint32_t kUpdateTaskStackWords = 4096;
 constexpr TickType_t kUpdateTaskDelayTicks = pdMS_TO_TICKS(10);
+#if defined(ARDUINO_ARCH_ESP32) && !(defined(CONFIG_FREERTOS_UNICORE) && CONFIG_FREERTOS_UNICORE)
+constexpr BaseType_t kUpdateTaskCore = 1; // APP CPU keeps Wi-Fi/ESPNOW on core 0 responsive
+#else
+constexpr BaseType_t kUpdateTaskCore = tskNO_AFFINITY;
+#endif
 } // namespace
 
 void ControlSystem::begin() {
   Serial.println("ControlSystem initialization started");
 
   statusLed_.begin(config::kStatusLedPin);
-  statusLed_.setMode(StatusLed::Mode::kPairing);
+  statusLed_.setMode(StatusLed::Mode::kBoot);
+  statusLed_.setDriveBalance(0.0f, 0.0f);
 
   for (std::size_t i = 0; i < config::kMotorCount; ++i) {
     motors_[i].begin(config::kMotorPins[i]);
@@ -72,8 +87,13 @@ void ControlSystem::begin() {
       [](ota_error_t error) { Serial.printf("OTA Error[%u]\n", error); });
 
   if (updateTaskHandle_ == nullptr) {
+#if defined(ARDUINO_ARCH_ESP32) && !(defined(CONFIG_FREERTOS_UNICORE) && CONFIG_FREERTOS_UNICORE)
+    BaseType_t result = xTaskCreatePinnedToCore(UpdateTaskTrampoline, "ControlUpdate", kUpdateTaskStackWords, this,
+                                                kUpdateTaskPriority, &updateTaskHandle_, kUpdateTaskCore);
+#else
     BaseType_t result = xTaskCreate(UpdateTaskTrampoline, "ControlUpdate", kUpdateTaskStackWords, this,
                                     kUpdateTaskPriority, &updateTaskHandle_);
+#endif
     if (result != pdPASS) {
       Serial.println("Failed to create control update task");
       updateTaskHandle_ = nullptr;
@@ -83,8 +103,8 @@ void ControlSystem::begin() {
   pendingPairingTone_ = false;
   paired_ = false;
   failsafeActive_ = false;
+  bootGreetingComplete_ = false;
   lastCommandTimestamp_ = 0;
-  updateStatusForPairing();
 
   Serial.println("ControlSystem initialization complete");
 }
@@ -107,7 +127,16 @@ void ControlSystem::updateTask() {
     buzzer_.update();
     statusLed_.update();
 
-    if (pendingPairingTone_ && !buzzer_.isPlaying()) {
+    if (!bootGreetingComplete_) {
+      if (!buzzer_.isPlaying()) {
+        bootGreetingComplete_ = true;
+        if (paired_) {
+          updateStatusForConnection();
+        } else {
+          updateStatusForPairing();
+        }
+      }
+    } else if (pendingPairingTone_ && !buzzer_.isPlaying()) {
       buzzer_.playSequence(kPairingSequence, ToneSequenceLength(kPairingSequence));
       pendingPairingTone_ = false;
     }
@@ -184,6 +213,7 @@ void ControlSystem::enterFailsafe() {
 
   stopAllMotors();
   buzzer_.playSequence(kFailsafeSequence, ToneSequenceLength(kFailsafeSequence));
+  pendingPairingTone_ = false;
   failsafeActive_ = true;
   statusLed_.setMode(StatusLed::Mode::kFailsafe);
 }
@@ -222,11 +252,15 @@ void ControlSystem::updateDriveIndicator() {
 }
 
 void ControlSystem::updateStatusForPairing() {
-  statusLed_.setMode(StatusLed::Mode::kFailsafe);
+  statusLed_.setMode(StatusLed::Mode::kPairing);
   statusLed_.setDriveBalance(0.0f, 0.0f);
+  if (bootGreetingComplete_) {
+    pendingPairingTone_ = true;
+  }
 }
 
 void ControlSystem::updateStatusForConnection() {
+  pendingPairingTone_ = false;
   statusLed_.setMode(StatusLed::Mode::kConnected);
   updateDriveIndicator();
 }

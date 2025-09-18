@@ -37,6 +37,7 @@ private:
   bool failsafeActive_ = false;
   bool pendingPairingTone_ = false;
   bool paired_ = false;
+  bool bootGreetingComplete_ = false;
   float lastMotorCommands_[config::kMotorCount] = {0};
 
   TaskHandle_t updateTaskHandle_ = nullptr;

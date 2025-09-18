@@ -2,6 +2,10 @@
 
 #include <Arduino.h>
 #include <cstdint>
+#include <esp32-hal-timer.h>
+#include <esp_attr.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/portmacro.h>
 
 #include "device_config.h"
 
@@ -14,10 +18,28 @@ public:
   void stop();
 
 private:
+  void configurePwmUnlocked(float magnitude, bool forward, uint32_t frequency);
+  void setBrakeUnlocked();
+  void releaseBrakeUnlocked();
+  void stopUnlocked();
+  void setActivePinHighUnlocked();
+  void setPinsLowUnlocked();
+  void setBothPinsHighUnlocked();
+  void handleTimerInterrupt();
+
   static uint32_t selectFrequency(float magnitude);
-  void writeDuty(uint16_t forwardDuty, uint16_t reverseDuty);
 
   config::MotorPinConfig config_{};
-  uint32_t currentFrequency_ = config::kMotorPwmFrequencyHigh;
+  hw_timer_t *timer_ = nullptr;
+  portMUX_TYPE timerMux_ = portMUX_INITIALIZER_UNLOCKED;
+  volatile uint32_t currentFrequency_ = config::kMotorPwmFrequencyHigh;
+  volatile uint32_t periodTicks_ = 0;
+  volatile uint32_t highTicks_ = 0;
+  volatile bool pwmActive_ = false;
+  volatile bool phaseHigh_ = false;
+  volatile bool forwardActive_ = true;
+  volatile bool brakeActive_ = false;
+
+  friend void IRAM_ATTR MotorDriverTimerDispatch(uint8_t timerIndex);
 };
 
