@@ -44,12 +44,17 @@ void ensurePeer(const uint8_t *mac) {
   esp_now_add_peer(&peerInfo);
 }
 
-void sendIdentity(const uint8_t *mac, protocol::MessageType type) {
+void sendIdentity(const uint8_t *mac, protocol::MessageType type,
+                  const uint8_t *ackTargetMac = nullptr) {
   protocol::IdentityMessage response{};
   response.type = static_cast<uint8_t>(type);
   std::strncpy(response.identity, config::kDeviceIdentity, sizeof(response.identity));
   response.identity[sizeof(response.identity) - 1] = '\0';
-  WiFi.softAPmacAddress(response.mac);
+  if (ackTargetMac != nullptr) {
+    std::memcpy(response.mac, ackTargetMac, sizeof(response.mac));
+  } else {
+    WiFi.softAPmacAddress(response.mac);
+  }
   ensurePeer(mac);
   esp_now_send(mac, reinterpret_cast<const uint8_t *>(&response), sizeof(response));
   Serial.println("sending mac to peer");
@@ -70,15 +75,15 @@ void handleControllerIdentity(const uint8_t *mac, const protocol::IdentityMessag
   WiFi.softAPmacAddress(selfMac);
   Serial.println("Controller Identity handling");
   if (macIsNonZero(message.mac) && std::memcmp(message.mac, selfMac, sizeof(selfMac)) != 0) {
+    Serial.println("Controller identity dropped!");
     return;
-      Serial.println("Controller identity dropped!");
   }
 
   std::memcpy(g_controllerMac, mac, sizeof(g_controllerMac));
   std::strncpy(g_controllerIdentity, message.identity, sizeof(g_controllerIdentity));
   g_controllerIdentity[sizeof(g_controllerIdentity) - 1] = '\0';
   ensurePeer(mac);
-  sendIdentity(mac, protocol::MessageType::kDroneAck);
+  sendIdentity(mac, protocol::MessageType::kDroneAck, mac);
   std::memset(&g_lastCommand, 0, sizeof(g_lastCommand));
   g_lastTimestamp = 0;
   g_paired = true;
