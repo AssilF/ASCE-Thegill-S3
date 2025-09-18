@@ -1,12 +1,10 @@
 #pragma once
 
 #include <Arduino.h>
-#include <atomic>
 #include <cstddef>
 #include <cstdint>
 
-#include <driver/gpio.h>
-#include <esp_timer.h>
+#include "device_config.h"
 
 struct ToneStep {
   uint16_t frequencyHz;
@@ -32,11 +30,8 @@ private:
   void loadNextStep();
   void startTone(uint16_t frequencyHz);
   void stopToneOutput();
-  static void TimerCallback(void *arg);
-  void handleTimerCallback();
 
   uint8_t pinNumber_ = 0;
-  gpio_num_t gpioPin_ = GPIO_NUM_NC;
   bool playing_ = false;
   bool looping_ = false;
   bool inPause_ = false;
@@ -45,8 +40,6 @@ private:
   std::size_t currentIndex_ = 0;
   uint32_t nextChangeMs_ = 0;
   uint16_t pendingPauseMs_ = 0;
-  esp_timer_handle_t toneTimer_ = nullptr;
-  std::atomic<bool> toneActive_{false};
-  std::atomic<bool> pinState_{false};
+  uint8_t channel_ = config::kBuzzerChannel;
 };
 
