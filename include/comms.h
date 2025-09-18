@@ -21,12 +21,6 @@ struct DriveCommand {
   uint8_t reserved;
 } __attribute__((packed));
 
-struct Command {
-  DriveCommand drive;
-  uint16_t brakeMask;
-  bool fromIlite;
-};
-
 enum PairingType : uint8_t {
   kScanRequest = 0x01,
   kDroneIdentity = 0x02,
@@ -42,7 +36,7 @@ struct IdentityMessage {
 
 bool init(const char *ssid, const char *password, uint8_t channel);
 bool paired();
-bool receiveCommand(Command &command);
+bool receiveCommand(DriveCommand &cmd);
 uint32_t lastCommandTimestamp();
 const uint8_t *controllerMac();
 const char *controllerIdentity();

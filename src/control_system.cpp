@@ -6,24 +6,23 @@
 
 namespace {
 constexpr ToneStep kPairingSequence[] = {
-    {1319, 120, 20}, // E6
-    {1760, 120, 0},  // A6
+    {500, 4000, 2000}, // E6
+    {4000, 2000, 3000},  // A6
 };
 
 constexpr ToneStep kConnectedSequence[] = {
-    {880, 120, 10}, // A5
-    {1175, 200, 0}, // D6
+    {500, 4000, 2000}, // E6
+    {4000, 2000, 3000},  // A6
 };
 
 constexpr ToneStep kHonkSequence[] = {
-    {392, 300, 20}, // G4
-    {311, 300, 0},  // D#4
+    {500, 4000, 2000}, // E6
+    {4000, 2000, 3000},  // A6
 };
 
 constexpr ToneStep kFailsafeSequence[] = {
-    {220, 180, 20}, // A3
-    {0, 120, 0},
-    {220, 180, 0},
+    {500, 4000, 2000}, // E6
+    {4000, 2000, 3000},  // A6
 };
 
 constexpr UBaseType_t kUpdateTaskPriority = 2;
@@ -35,7 +34,7 @@ void ControlSystem::begin() {
   Serial.println("ControlSystem initialization started");
 
   statusLed_.begin(config::kStatusLedPin);
-  statusLed_.setMode(StatusLed::Mode::kBoot);
+  statusLed_.setMode(StatusLed::Mode::kPairing);
 
   for (std::size_t i = 0; i < config::kMotorCount; ++i) {
     motors_[i].begin(config::kMotorPins[i]);
@@ -96,7 +95,7 @@ void ControlSystem::UpdateTaskTrampoline(void *param) {
 }
 
 void ControlSystem::updateTask() {
-  Comms::Command command{};
+  Comms::DriveCommand command{};
   uint32_t lastAppliedTimestamp = 0;
 
   while (true) {
@@ -141,16 +140,15 @@ void ControlSystem::updateTask() {
   }
 }
 
-void ControlSystem::applyDriveCommand(const Comms::Command &command, uint32_t timestamp) {
-  const auto &drive = command.drive;
-  if (drive.magic != Comms::kDrivePacketMagic) {
+void ControlSystem::applyDriveCommand(const Comms::DriveCommand &command, uint32_t timestamp) {
+  if (command.magic != Comms::kDrivePacketMagic) {
     return;
   }
 
-  const bool brakeAll = (drive.flags & Comms::kDriveFlagBrake) != 0;
-  const bool honk = (drive.flags & Comms::kDriveFlagHonk) != 0;
+  const bool brakeAll = (command.flags & Comms::kDriveFlagBrake) != 0;
+  const bool honk = (command.flags & Comms::kDriveFlagHonk) != 0;
 
-  const int16_t motorValues[] = {drive.leftFront, drive.leftRear, drive.rightFront, drive.rightRear};
+  const int16_t motorValues[] = {command.leftFront, command.leftRear, command.rightFront, command.rightRear};
   constexpr std::size_t kDriveMotorCount = sizeof(motorValues) / sizeof(motorValues[0]);
 
   exitFailsafe();
@@ -160,12 +158,8 @@ void ControlSystem::applyDriveCommand(const Comms::Command &command, uint32_t ti
     if (i < kDriveMotorCount) {
       value = static_cast<float>(motorValues[i]) / 1000.0f;
     }
-    bool motorBrake = brakeAll;
-    if (command.fromIlite) {
-      motorBrake = (command.brakeMask & static_cast<uint16_t>(1U << i)) != 0;
-    }
-    motors_[i].applyCommand(value, motorBrake);
-    lastMotorCommands_[i] = motorBrake ? 0.0f : value;
+    motors_[i].applyCommand(value, brakeAll);
+    lastMotorCommands_[i] = brakeAll ? 0.0f : value;
   }
 
   lastCommandTimestamp_ = timestamp;
