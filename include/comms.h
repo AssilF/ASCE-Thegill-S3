@@ -9,10 +9,12 @@
 namespace Comms {
 
 struct DriveCommand {
-  uint32_t sequence;
-  uint8_t version;
-  int16_t motorDuty[config::kMotorCount];
-  uint16_t flags;
+  
+  uint32_t sequence = 0;
+  uint8_t version = 0;
+  int16_t motorDuty[config::kMotorCount] = {0};
+  uint16_t flags = 0;
+
 };
 
 bool init(const char *ssid, const char *password, uint8_t channel);
