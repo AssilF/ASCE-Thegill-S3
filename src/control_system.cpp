@@ -9,12 +9,6 @@
 #include "network_setup.h"
 
 namespace {
-constexpr ToneStep kBootSequence[] = {
-    {784, 200, 30},  // G5
-    {988, 160, 30},  // B5
-    {1568, 180, 0},  // G6
-};
-
 constexpr ToneStep kPairingSequence[] = {
     {1319, 120, 20}, // E6
     {1760, 120, 0},  // A6
@@ -53,7 +47,7 @@ void ControlSystem::begin() {
   }
 
   buzzer_.begin(config::kBuzzerPin, config::kBuzzerChannel, config::kBuzzerResolutionBits);
-  buzzer_.playSequence(kBootSequence, ToneSequenceLength(kBootSequence));
+  buzzer_.playBootSequence();
 
   ConfigureWiFi(config::kDeviceIdentity, config::kAccessPointSsid, config::kAccessPointPassword,
                 config::kEspNowChannel);
