@@ -43,6 +43,11 @@ constexpr uint8_t kBuzzerChannel = 0;
 constexpr uint8_t kBuzzerResolutionBits = 10;
 constexpr uint8_t kBuzzerMinResolutionBits = 4;
 
+constexpr uint16_t kBuzzerRetuneGuardMs = 6;
+constexpr uint16_t kBuzzerRetuneGuardMinDeltaHz = 12;
+constexpr uint8_t kBuzzerRetuneGuardDeltaPercent = 6;
+
+
 constexpr uint8_t kPwmResolutionBits = 8;
 constexpr uint16_t kPwmMaxDuty = (1U << kPwmResolutionBits) - 1U;
 

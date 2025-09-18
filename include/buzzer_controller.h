@@ -47,5 +47,10 @@ private:
   uint32_t requestedFrequencyHz_ = 0;
   uint32_t currentFrequencyHz_ = 0;
   uint8_t currentResolutionBits_ = config::kBuzzerResolutionBits;
+
+  bool pendingGuardStep_ = false;
+  ToneStep guardStep_{};
+  uint32_t guardReleaseMs_ = 0;
+
 };
 
