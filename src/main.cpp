@@ -1,18 +1,17 @@
 #include <Arduino.h>
 
-// put function declarations here:
-int myFunction(int, int);
+#include "control_system.h"
+
+ControlSystem g_controlSystem;
 
 void setup() {
-  // put your setup code here, to run once:
-  int result = myFunction(2, 3);
+  Serial.begin(115200);
+  delay(200);
+  Serial.println();
+  Serial.println("=== Thegiller-PT12 Boot ===");
+
+  g_controlSystem.begin();
 }
 
-void loop() {
-  // put your main code here, to run repeatedly:
-}
+void loop() { g_controlSystem.loop(); }
 
-// put function definitions here:
-int myFunction(int x, int y) {
-  return x + y;
-}
