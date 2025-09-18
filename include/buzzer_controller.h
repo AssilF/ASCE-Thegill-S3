@@ -30,6 +30,7 @@ private:
   void loadNextStep();
   void startTone(uint16_t frequencyHz);
   void stopToneOutput();
+  bool configureToneTimer(uint32_t frequencyHz);
 
   uint8_t pinNumber_ = 0;
   bool playing_ = false;
@@ -41,5 +42,13 @@ private:
   uint32_t nextChangeMs_ = 0;
   uint16_t pendingPauseMs_ = 0;
   uint8_t channel_ = config::kBuzzerChannel;
+  bool initialized_ = false;
+  bool timerConfigured_ = false;
+  uint32_t requestedFrequencyHz_ = 0;
+  uint32_t currentFrequencyHz_ = 0;
+  uint8_t currentResolutionBits_ = config::kBuzzerResolutionBits;
+  bool pendingGuardStep_ = false;
+  ToneStep guardStep_{};
+  uint32_t guardReleaseMs_ = 0;
 };
 
