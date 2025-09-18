@@ -75,7 +75,7 @@ void ControlSystem::begin() {
     lastMotorCommands_[i] = 0.0f;
   }
 
-  buzzer_.begin(config::kBuzzerPin, config::kBuzzerChannel, config::kBuzzerResolutionBits);
+  buzzer_.begin(config::kBuzzerPin);
   buzzer_.playBootSequence();
 
   ConfigureWiFi(config::kDeviceIdentity, config::kAccessPointSsid, config::kAccessPointPassword,
