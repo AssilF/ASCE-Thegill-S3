@@ -118,8 +118,8 @@ void ControlSystem::updateTask() {
       paired_ = true;
       pendingPairingTone_ = false;
       stopAllMotors();
-      const uint8_t *mac = Comms::controllerMac();
-      const char *identity = Comms::controllerIdentity();
+      const uint8_t *mac = Comms::BroadcastMac;
+      const char *identity = Comms::DRONE_IDENTITY;
       Serial.printf("Paired with controller %s (%02X:%02X:%02X:%02X:%02X:%02X)\n",
                     (identity != nullptr) ? identity : "",
                     mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
