@@ -47,9 +47,9 @@ void ensurePeer(const uint8_t *mac) {
   std::memcpy(peerInfo.peer_addr, mac, sizeof(peerInfo.peer_addr));
   peerInfo.channel = g_channel;
   peerInfo.encrypt = false;
-  peerInfo.ifidx = WIFI_IF_AP;
   esp_now_add_peer(&peerInfo);
 }
+
 
 void sendIdentity(const uint8_t *mac, PairingType type) {
   if (mac == nullptr) {
@@ -78,6 +78,7 @@ void handleControllerIdentity(const uint8_t *mac, const IdentityMessage &message
 
   ensurePeer(mac);
 
+
   std::memcpy(g_controllerMac, mac, sizeof(g_controllerMac));
   std::memcpy(g_controllerIdentity, message.identity, sizeof(message.identity));
   g_controllerIdentity[sizeof(g_controllerIdentity) - 1] = '\0';
@@ -96,6 +97,7 @@ void handleControllerIdentity(const uint8_t *mac, const IdentityMessage &message
   Serial.printf("Paired with controller %s\n", g_controllerIdentity);
 }
 
+
 void handleIdentityMessage(const uint8_t *mac, const IdentityMessage &message) {
   const auto type = static_cast<PairingType>(message.type);
   switch (type) {
@@ -112,6 +114,7 @@ void handleIdentityMessage(const uint8_t *mac, const IdentityMessage &message) {
 
 void storeDriveCommand(const uint8_t *mac, const DriveCommand &command) {
   if (!g_paired || mac == nullptr || std::memcmp(mac, g_controllerMac, sizeof(g_controllerMac)) != 0) {
+
     return;
   }
 
@@ -128,8 +131,10 @@ void onDataRecv(const uint8_t *mac, const uint8_t *incomingData, int len) {
     return;
   }
 
+
   if (len == static_cast<int>(sizeof(IdentityMessage))) {
     handleIdentityMessage(mac, *reinterpret_cast<const IdentityMessage *>(incomingData));
+
     return;
   }
 
@@ -144,7 +149,9 @@ const uint8_t kBroadcastMac[6] = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
 
 bool init(const char *ssid, const char *password, uint8_t channel) {
   g_channel = channel;
+
   resetState();
+
 
   WiFi.mode(WIFI_AP_STA);
   WiFi.setTxPower(WIFI_POWER_8_5dBm);
@@ -152,7 +159,9 @@ bool init(const char *ssid, const char *password, uint8_t channel) {
   WiFi.softAP(ssid, password, channel);
 
   if (esp_now_init() != ESP_OK) {
+
     Serial.println("Failed to initialize ESP-NOW");
+
     return false;
   }
 

@@ -10,11 +10,11 @@ namespace protocol {
 constexpr uint8_t kControlProtocolVersion = 1;
 
 enum class MessageType : uint8_t {
-  kScanRequest = 0,
-  kDroneIdentity = 1,
-  kControllerIdentity = 2,
-  kDroneAck = 3,
-  kControlCommand = 4,
+  kScanRequest = 0x01,
+  kDroneIdentity = 0x02,
+  kControllerIdentity = 0x03,
+  kDroneAck = 0x04,
+  kControlCommand = 0x05,
 };
 
 constexpr uint16_t kControlFlagHonk = 1u << 0;
@@ -25,9 +25,9 @@ constexpr uint16_t BrakeFlagForMotor(std::size_t motorIndex) {
 
 struct IdentityMessage {
   uint8_t type = 0;
-  char identity[32] = {};
+  char identity[16] = {};
   uint8_t mac[6] = {};
-};
+} __attribute__((packed));
 
 struct ControlMessage {
   uint8_t type = 0;
@@ -35,7 +35,7 @@ struct ControlMessage {
   uint32_t sequence = 0;
   int16_t motorDuty[config::kMotorCount] = {};
   uint16_t flags = 0;
-};
+} __attribute__((packed));
 
 constexpr uint16_t kGillPacketMagic = 0x474c; // 'GL'
 
@@ -49,7 +49,7 @@ struct GillControlPacket {
   int16_t leftRear = 0;
   int16_t rightFront = 0;
   int16_t rightRear = 0;
-};
+} __attribute__((packed));
 
 } // namespace protocol
 

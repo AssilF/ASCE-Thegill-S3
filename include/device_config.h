@@ -41,6 +41,7 @@ constexpr MotorPinConfig kMotorPins[kMotorCount] = {
 constexpr uint8_t kBuzzerPin = 47;
 constexpr uint8_t kBuzzerChannel = 0;
 constexpr uint8_t kBuzzerResolutionBits = 10;
+constexpr uint8_t kBuzzerMinResolutionBits = 4;
 
 constexpr uint8_t kPwmResolutionBits = 8;
 constexpr uint16_t kPwmMaxDuty = (1U << kPwmResolutionBits) - 1U;
