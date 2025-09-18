@@ -4,6 +4,7 @@
 
 namespace Comms {
 namespace {
+
 constexpr uint32_t kHandshakeCooldownMs = 500;
 constexpr std::size_t kIdentityLength = sizeof(protocol::IdentityMessage::identity);
 
@@ -24,6 +25,7 @@ bool macIsNonZero(const uint8_t *mac) {
   }
   return false;
 }
+
 
 void ensurePeer(const uint8_t *mac) {
   if (esp_now_is_peer_exist(mac)) {
@@ -46,6 +48,7 @@ void sendIdentity(const uint8_t *mac, protocol::MessageType type) {
   WiFi.softAPmacAddress(response.mac);
   ensurePeer(mac);
   esp_now_send(mac, reinterpret_cast<const uint8_t *>(&response), sizeof(response));
+
   g_lastHandshakeMs = millis();
 }
 
@@ -119,12 +122,37 @@ DriveCommand convertGillPacket(const protocol::GillControlPacket &packet) {
 }
 
 void handleControlMessage(const uint8_t *mac, const protocol::ControlMessage &message) {
+
+}
+
+void handleIdentityMessage(const uint8_t *mac, const protocol::IdentityMessage &message) {
+  const auto msgType = static_cast<protocol::MessageType>(message.type);
+  switch (msgType) {
+  case protocol::MessageType::kScanRequest:
+    sendIdentity(mac, protocol::MessageType::kDroneIdentity);
+    break;
+  case protocol::MessageType::kControllerIdentity:
+    std::memcpy(g_controllerMac, mac, sizeof(g_controllerMac));
+    std::strncpy(g_controllerIdentity, message.identity, sizeof(g_controllerIdentity));
+    g_controllerIdentity[sizeof(g_controllerIdentity) - 1] = '\0';
+    ensurePeer(mac);
+    sendIdentity(mac, protocol::MessageType::kDroneAck);
+    g_paired = true;
+    break;
+  default:
+    break;
+  }
+}
+
+void handleControlMessage(const uint8_t *mac, const protocol::ControlMessage &message) {
+  (void)mac;
+
   if (message.type != static_cast<uint8_t>(protocol::MessageType::kControlCommand)) {
     return;
   }
   if (message.version != protocol::kControlProtocolVersion) {
     return;
-  }
+
   if (!g_paired || std::memcmp(mac, g_controllerMac, sizeof(g_controllerMac)) != 0) {
     return;
   }
@@ -141,6 +169,11 @@ void handleGillPacket(const uint8_t *mac, const protocol::GillControlPacket &pac
   }
 
   storeDriveCommand(convertGillPacket(packet));
+
+
+  g_lastMessage = message;
+  g_lastTimestamp = millis();
+
 }
 
 void onDataRecv(const uint8_t *mac, const uint8_t *incomingData, int len) {
@@ -153,15 +186,18 @@ void onDataRecv(const uint8_t *mac, const uint8_t *incomingData, int len) {
     return;
   }
 
+
   if (len == static_cast<int>(sizeof(protocol::GillControlPacket))) {
     handleGillPacket(mac, *reinterpret_cast<const protocol::GillControlPacket *>(incomingData));
     return;
   }
 
+
   if (len == static_cast<int>(sizeof(protocol::ControlMessage))) {
     handleControlMessage(mac, *reinterpret_cast<const protocol::ControlMessage *>(incomingData));
   }
 }
+
 
 void handleIdentityMessage(const uint8_t *mac, const protocol::IdentityMessage &message) {
   const auto msgType = static_cast<protocol::MessageType>(message.type);
@@ -177,6 +213,7 @@ void handleIdentityMessage(const uint8_t *mac, const protocol::IdentityMessage &
   }
 }
 
+
 } // namespace
 
 const uint8_t kBroadcastMac[6] = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
@@ -185,14 +222,19 @@ bool init(const char *ssid, const char *password, uint8_t channel) {
   g_channel = channel;
   g_paired = false;
   g_lastTimestamp = 0;
+
   g_syntheticSequence = 0;
   g_lastHandshakeMs = 0;
   std::memset(&g_lastCommand, 0, sizeof(g_lastCommand));
+
+
   std::memset(g_controllerMac, 0, sizeof(g_controllerMac));
   std::memset(g_controllerIdentity, 0, sizeof(g_controllerIdentity));
 
   WiFi.mode(WIFI_AP_STA);
+
   WiFi.setTxPower(WIFI_POWER_8_5dBm);
+
   WiFi.setSleep(false);
   WiFi.softAP(ssid, password, channel);
 
@@ -210,7 +252,14 @@ bool receiveCommand(DriveCommand &cmd) {
     return false;
   }
 
+
   cmd = g_lastCommand;
+
+  cmd.sequence = g_lastMessage.sequence;
+  cmd.version = g_lastMessage.version;
+  std::memcpy(cmd.motorDuty, g_lastMessage.motorDuty, sizeof(cmd.motorDuty));
+  cmd.flags = g_lastMessage.flags;
+
   return true;
 }
 
