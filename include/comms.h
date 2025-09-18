@@ -33,6 +33,11 @@ struct IdentityMessage {
   char identity[16];
   uint8_t mac[6];
 } __attribute__((packed));
+  uint32_t sequence;
+  uint8_t version;
+  int16_t motorDuty[config::kMotorCount];
+  uint16_t flags;
+};
 
 bool init(const char *ssid, const char *password, uint8_t channel);
 bool paired();

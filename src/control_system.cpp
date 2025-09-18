@@ -1,5 +1,5 @@
 #include "control_system.h"
-
+#include "device_config.h"
 #include <Arduino.h>
 #include <WiFi.h>
 #include <math.h>
