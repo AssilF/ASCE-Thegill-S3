@@ -18,6 +18,6 @@ private:
   void writeDuty(uint16_t forwardDuty, uint16_t reverseDuty);
 
   config::MotorPinConfig config_{};
-  uint32_t currentFrequency_ = 4000;
+  uint32_t currentFrequency_ = config::kMotorPwmFrequencyHigh;
 };
 

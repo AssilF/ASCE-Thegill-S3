@@ -20,11 +20,21 @@ struct MotorPinConfig {
   bool inverted;
 };
 
+constexpr float kMotorCommandDeadband = 0.01f;
+constexpr float kMotorFrequencyThresholdLow = 0.05f;
+constexpr float kMotorFrequencyThresholdMidLow = 0.2f;
+constexpr float kMotorFrequencyThresholdMidHigh = 0.5f;
+constexpr uint32_t kMotorPwmFrequencyLow = 400;
+constexpr uint32_t kMotorPwmFrequencyMidLow = 800;
+constexpr uint32_t kMotorPwmFrequencyMidHigh = 2000;
+constexpr uint32_t kMotorPwmFrequencyHigh = 4000;
+
 constexpr MotorPinConfig kMotorPins[kMotorCount] = {
-    {4, 5, 0, 1, false},   // Motor A
-    {6, 7, 2, 3, false},   // Motor B
-    {8, 9, 4, 5, false},   // Motor C
-    {10, 11, 6, 7, false}, // Motor D
+    // Left side motors share orientation, right side are mirrored and inverted.
+    {16, 15, 0, 1, false},  // Front left motor (H-bridge A1/A2)
+    {18, 17, 2, 3, false},  // Rear left motor (H-bridge B1/B2)
+    {13, 14, 4, 5, true},   // Front right motor (H-bridge C1/C2)
+    {11, 12, 6, 7, true},   // Rear right motor (H-bridge D1/D2)
 };
 
 constexpr uint8_t kBuzzerPin = 47;

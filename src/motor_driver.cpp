@@ -7,12 +7,12 @@ void MotorDriver::begin(const config::MotorPinConfig &config) {
   pinMode(config_.forwardPin, OUTPUT);
   pinMode(config_.reversePin, OUTPUT);
 
-  ledcSetup(config_.forwardChannel, 4000, config::kPwmResolutionBits);
-  ledcSetup(config_.reverseChannel, 4000, config::kPwmResolutionBits);
+  ledcSetup(config_.forwardChannel, config::kMotorPwmFrequencyHigh, config::kPwmResolutionBits);
+  ledcSetup(config_.reverseChannel, config::kMotorPwmFrequencyHigh, config::kPwmResolutionBits);
   ledcAttachPin(config_.forwardPin, config_.forwardChannel);
   ledcAttachPin(config_.reversePin, config_.reverseChannel);
   writeDuty(0, 0);
-  currentFrequency_ = 4000;
+  currentFrequency_ = config::kMotorPwmFrequencyHigh;
 }
 
 void MotorDriver::applyCommand(float command, bool brake) {
@@ -36,9 +36,9 @@ void MotorDriver::applyCommand(float command, bool brake) {
 
   const uint16_t dutyValue = static_cast<uint16_t>(roundf(magnitude * config::kPwmMaxDuty));
 
-  if (constrained > 0.01f) {
+  if (constrained > config::kMotorCommandDeadband) {
     writeDuty(dutyValue, 0);
-  } else if (constrained < -0.01f) {
+  } else if (constrained < -config::kMotorCommandDeadband) {
     writeDuty(0, dutyValue);
   } else {
     writeDuty(0, 0);
@@ -48,16 +48,16 @@ void MotorDriver::applyCommand(float command, bool brake) {
 void MotorDriver::stop() { writeDuty(0, 0); }
 
 uint32_t MotorDriver::selectFrequency(float magnitude) {
-  if (magnitude < 0.05f) {
-    return 400;
+  if (magnitude < config::kMotorFrequencyThresholdLow) {
+    return config::kMotorPwmFrequencyLow;
   }
-  if (magnitude < 0.2f) {
-    return 800;
+  if (magnitude < config::kMotorFrequencyThresholdMidLow) {
+    return config::kMotorPwmFrequencyMidLow;
   }
-  if (magnitude < 0.5f) {
-    return 2000;
+  if (magnitude < config::kMotorFrequencyThresholdMidHigh) {
+    return config::kMotorPwmFrequencyMidHigh;
   }
-  return 4000;
+  return config::kMotorPwmFrequencyHigh;
 }
 
 void MotorDriver::writeDuty(uint16_t forwardDuty, uint16_t reverseDuty) {
