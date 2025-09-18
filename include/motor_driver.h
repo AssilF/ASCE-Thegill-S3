@@ -16,6 +16,7 @@ public:
   void begin(const config::MotorPinConfig &config);
   void applyCommand(float command, bool brake);
   void stop();
+  void handleTimerInterrupt();
 
 private:
   void configurePwmUnlocked(float magnitude, bool forward, uint32_t frequency);
@@ -25,7 +26,7 @@ private:
   void setActivePinHighUnlocked();
   void setPinsLowUnlocked();
   void setBothPinsHighUnlocked();
-  void handleTimerInterrupt();
+
 
   static uint32_t selectFrequency(float magnitude);
 

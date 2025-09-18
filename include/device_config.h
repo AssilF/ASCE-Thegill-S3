@@ -5,10 +5,10 @@
 
 namespace config {
 
-constexpr const char kDeviceIdentity[] = "Thegiller-PT12";
+constexpr const char kDeviceIdentity[] = "GillerT12";
 constexpr const char kAccessPointSsid[] = "Thegill PORT";
 constexpr const char kAccessPointPassword[] = "ASCE321#";
-constexpr uint8_t kEspNowChannel = 0;
+constexpr uint8_t kEspNowChannel = 6;
 constexpr std::size_t kMotorCount = 4;
 constexpr uint32_t kControlTimeoutMs = 500;
 

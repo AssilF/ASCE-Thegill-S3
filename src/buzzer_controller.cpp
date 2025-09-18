@@ -116,9 +116,9 @@ void BuzzerController::startTone(uint16_t frequencyHz) {
     return;
   }
 
-  ledcWriteTone(channel_, static_cast<double>(frequencyHz));
+  ledcWriteTone(channel_, static_cast<u32_t>(frequencyHz));
   const uint32_t duty = 1U << (config::kBuzzerResolutionBits - 1U);
-  ledcWrite(channel_, duty);
+  //ledcWrite(channel_, duty);
 }
 
 void BuzzerController::stopToneOutput() {

@@ -27,6 +27,16 @@ inline void IRAM_ATTR writePinLow(uint8_t pin) {
 
 MotorDriver *g_timerOwners[kHardwareTimerCount] = {nullptr};
 
+void IRAM_ATTR MotorDriverTimerDispatch(uint8_t timerIndex) {
+  if (timerIndex >= kHardwareTimerCount) {
+    return;
+  }
+  MotorDriver *driver = g_timerOwners[timerIndex];
+  if (driver != nullptr) {
+    driver->handleTimerInterrupt();
+  }
+}
+
 void IRAM_ATTR TimerTrampoline0() { MotorDriverTimerDispatch(0); }
 void IRAM_ATTR TimerTrampoline1() { MotorDriverTimerDispatch(1); }
 void IRAM_ATTR TimerTrampoline2() { MotorDriverTimerDispatch(2); }
@@ -41,15 +51,6 @@ constexpr TimerIsr kTimerTrampolines[kHardwareTimerCount] = {
 };
 } // namespace
 
-void IRAM_ATTR MotorDriverTimerDispatch(uint8_t timerIndex) {
-  if (timerIndex >= kHardwareTimerCount) {
-    return;
-  }
-  MotorDriver *driver = g_timerOwners[timerIndex];
-  if (driver != nullptr) {
-    driver->handleTimerInterrupt();
-  }
-}
 
 void MotorDriver::begin(const config::MotorPinConfig &config) {
   config_ = config;
