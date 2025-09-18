@@ -4,6 +4,8 @@
 #include <WiFi.h>
 #include <math.h>
 
+#include "control_protocol.h"
+
 namespace {
 constexpr ToneStep kPairingSequence[] = {
     {500, 4000, 2000}, // E6
@@ -141,25 +143,19 @@ void ControlSystem::updateTask() {
 }
 
 void ControlSystem::applyDriveCommand(const Comms::DriveCommand &command, uint32_t timestamp) {
-  if (command.magic != Comms::kDrivePacketMagic) {
+  if (command.version != protocol::kControlProtocolVersion) {
     return;
   }
 
-  const bool brakeAll = (command.flags & Comms::kDriveFlagBrake) != 0;
-  const bool honk = (command.flags & Comms::kDriveFlagHonk) != 0;
-
-  const int16_t motorValues[] = {command.leftFront, command.leftRear, command.rightFront, command.rightRear};
-  constexpr std::size_t kDriveMotorCount = sizeof(motorValues) / sizeof(motorValues[0]);
+  const bool honk = (command.flags & protocol::kControlFlagHonk) != 0;
 
   exitFailsafe();
 
   for (std::size_t i = 0; i < config::kMotorCount; ++i) {
-    float value = 0.0f;
-    if (i < kDriveMotorCount) {
-      value = static_cast<float>(motorValues[i]) / 1000.0f;
-    }
-    motors_[i].applyCommand(value, brakeAll);
-    lastMotorCommands_[i] = brakeAll ? 0.0f : value;
+    const float duty = static_cast<float>(command.motorDuty[i]) / 1000.0f;
+    const bool brake = (command.flags & protocol::BrakeFlagForMotor(i)) != 0;
+    motors_[i].applyCommand(duty, brake);
+    lastMotorCommands_[i] = brake ? 0.0f : duty;
   }
 
   lastCommandTimestamp_ = timestamp;
