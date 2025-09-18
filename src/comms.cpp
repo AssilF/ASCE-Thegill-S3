@@ -1,38 +1,45 @@
 #include "comms.h"
+
 #include <Arduino.h>
 #include <WiFi.h>
 #include <cstring>
 #include <esp_now.h>
-#include <device_config.h>
-#include <control_protocol.h>
-#include <motor_driver.h>
+
+#include "device_config.h"
 
 namespace Comms {
 namespace {
-constexpr uint8_t kIdentityStringLength = sizeof(protocol::IdentityMessage::identity);
-constexpr uint32_t kHandshakeCooldownMs = 1000; // Cooldown in milliseconds
+
+enum class PairingType : uint8_t {
+  kScanRequest = 0x01,
+  kDroneIdentity = 0x02,
+  kControllerIdentity = 0x03,
+  kDroneAck = 0x04,
+};
+
+struct IdentityMessage {
+  uint8_t type = 0;
+  char identity[16] = {};
+  uint8_t mac[6] = {};
+} __attribute__((packed));
 
 bool g_paired = false;
-protocol::ControlMessage g_lastMessage{};
-DriveCommand g_lastCommand{}; // Added declaration for g_lastCommand
+DriveCommand g_lastCommand{};
 uint32_t g_lastTimestamp = 0;
 uint8_t g_controllerMac[6] = {0};
-char g_controllerIdentity[kIdentityStringLength] = {0};
+char g_controllerIdentity[sizeof(IdentityMessage::identity)] = {0};
 uint8_t g_channel = 0;
-uint32_t g_lastHandshakeMs = 0;
-uint32_t g_syntheticSequence = 0;
 
-bool macIsNonZero(const uint8_t *mac) {
-  for (std::size_t i = 0; i < 6; ++i) {
-    if (mac[i] != 0) {
-      return true;
-    }
-  }
-  return false;
+void resetState() {
+  g_paired = false;
+  g_lastCommand = DriveCommand{};
+  g_lastTimestamp = 0;
+  std::memset(g_controllerMac, 0, sizeof(g_controllerMac));
+  std::memset(g_controllerIdentity, 0, sizeof(g_controllerIdentity));
 }
 
 void ensurePeer(const uint8_t *mac) {
-  if (esp_now_is_peer_exist(mac)) {
+  if (mac == nullptr || esp_now_is_peer_exist(mac)) {
     return;
   }
 
@@ -44,152 +51,90 @@ void ensurePeer(const uint8_t *mac) {
   esp_now_add_peer(&peerInfo);
 }
 
-void sendIdentity(const uint8_t *mac, protocol::MessageType type,
-                  const uint8_t *ackTargetMac = nullptr) {
-  protocol::IdentityMessage response{};
+void sendIdentity(const uint8_t *mac, PairingType type) {
+  if (mac == nullptr) {
+    return;
+  }
+
+  IdentityMessage response{};
   response.type = static_cast<uint8_t>(type);
   std::strncpy(response.identity, config::kDeviceIdentity, sizeof(response.identity));
   response.identity[sizeof(response.identity) - 1] = '\0';
-  if (ackTargetMac != nullptr) {
-    std::memcpy(response.mac, ackTargetMac, sizeof(response.mac));
-  } else {
-    WiFi.softAPmacAddress(response.mac);
-  }
+  WiFi.softAPmacAddress(response.mac);
+
   ensurePeer(mac);
   esp_now_send(mac, reinterpret_cast<const uint8_t *>(&response), sizeof(response));
-  Serial.println("sending mac to peer");
-  g_lastHandshakeMs = millis();
 }
 
 void handleScanRequest(const uint8_t *mac) {
-  const uint32_t now = millis();
-  if (g_lastHandshakeMs != 0 && (now - g_lastHandshakeMs) < kHandshakeCooldownMs) {
-    return;
-  }
-  Serial.println("Something is trying to pair!");
-  sendIdentity(mac, protocol::MessageType::kDroneIdentity);
+  Serial.println("Pair request received; advertising THEGILL");
+  sendIdentity(mac, PairingType::kDroneIdentity);
 }
 
-void handleControllerIdentity(const uint8_t *mac, const protocol::IdentityMessage &message) {
-  uint8_t selfMac[6] = {0};
-  WiFi.softAPmacAddress(selfMac);
-  Serial.println("Controller Identity handling");
-  if (macIsNonZero(message.mac) && std::memcmp(message.mac, selfMac, sizeof(selfMac)) != 0) {
-    Serial.println("Controller identity dropped!");
+void handleControllerIdentity(const uint8_t *mac, const IdentityMessage &message) {
+  if (mac == nullptr) {
     return;
   }
+
+  ensurePeer(mac);
 
   std::memcpy(g_controllerMac, mac, sizeof(g_controllerMac));
-  std::strncpy(g_controllerIdentity, message.identity, sizeof(g_controllerIdentity));
+  std::memcpy(g_controllerIdentity, message.identity, sizeof(message.identity));
   g_controllerIdentity[sizeof(g_controllerIdentity) - 1] = '\0';
-  ensurePeer(mac);
-  sendIdentity(mac, protocol::MessageType::kDroneAck, mac);
-  std::memset(&g_lastCommand, 0, sizeof(g_lastCommand));
+
+  IdentityMessage ack{};
+  ack.type = static_cast<uint8_t>(PairingType::kDroneAck);
+  std::strncpy(ack.identity, config::kDeviceIdentity, sizeof(ack.identity));
+  ack.identity[sizeof(ack.identity) - 1] = '\0';
+  WiFi.softAPmacAddress(ack.mac);
+
+  esp_now_send(mac, reinterpret_cast<const uint8_t *>(&ack), sizeof(ack));
+
+  g_lastCommand = DriveCommand{};
   g_lastTimestamp = 0;
   g_paired = true;
+  Serial.printf("Paired with controller %s\n", g_controllerIdentity);
 }
 
-void storeDriveCommand(const DriveCommand &command) {
-  g_lastCommand = command;
-  g_lastTimestamp = millis();
-}
-
-DriveCommand convertControlMessage(const protocol::ControlMessage &message) {
-  DriveCommand cmd{};
-  cmd.sequence = message.sequence;
-  cmd.version = message.version;
-  std::memcpy(cmd.motorDuty, message.motorDuty, sizeof(cmd.motorDuty));
-  cmd.flags = message.flags;
-  return cmd;
-}
-
-DriveCommand convertGillPacket(const protocol::GillControlPacket &packet) {
-  DriveCommand cmd{};
-  cmd.version = protocol::kControlProtocolVersion;
-  cmd.sequence = ++g_syntheticSequence;
-  cmd.flags = 0;
-
-  const bool brake = (packet.flags & protocol::kGillFlagBrake) != 0;
-  if (brake) {
-    for (std::size_t i = 0; i < config::kMotorCount; ++i) {
-      cmd.motorDuty[i] = 0;
-      cmd.flags |= protocol::BrakeFlagForMotor(i);
-    }
-  } else {
-    const int16_t motors[] = {packet.leftFront, packet.leftRear, packet.rightFront, packet.rightRear};
-    constexpr std::size_t kGillMotorCount = sizeof(motors) / sizeof(motors[0]);
-    for (std::size_t i = 0; i < config::kMotorCount; ++i) {
-      cmd.motorDuty[i] = (i < kGillMotorCount) ? motors[i] : 0;
-    }
-  }
-
-  if (packet.flags & protocol::kGillFlagHonk) {
-    cmd.flags |= protocol::kControlFlagHonk;
-  }
-
-  return cmd;
-}
-
-void handleIdentityMessage(const uint8_t *mac, const protocol::IdentityMessage &message) {
-  const auto msgType = static_cast<protocol::MessageType>(message.type);
-  switch (msgType) {
-  case protocol::MessageType::kScanRequest:
-      Serial.println("Scan request!");
+void handleIdentityMessage(const uint8_t *mac, const IdentityMessage &message) {
+  const auto type = static_cast<PairingType>(message.type);
+  switch (type) {
+  case PairingType::kScanRequest:
     handleScanRequest(mac);
     break;
-  case protocol::MessageType::kControllerIdentity:
-    Serial.println("Controlller identity!");  
-  handleControllerIdentity(mac, message);
+  case PairingType::kControllerIdentity:
+    handleControllerIdentity(mac, message);
     break;
   default:
     break;
   }
 }
 
-void handleControlMessage(const uint8_t *mac, const protocol::ControlMessage &message) {
-  (void)mac;
-  if (message.type != static_cast<uint8_t>(protocol::MessageType::kControlCommand)) {
-    return;
-  }
-  if (message.version != protocol::kControlProtocolVersion) {
-    return;
-  }
-  if (!g_paired || std::memcmp(mac, g_controllerMac, sizeof(g_controllerMac)) != 0) {
+void storeDriveCommand(const uint8_t *mac, const DriveCommand &command) {
+  if (!g_paired || mac == nullptr || std::memcmp(mac, g_controllerMac, sizeof(g_controllerMac)) != 0) {
     return;
   }
 
-  storeDriveCommand(convertControlMessage(message));
-}
-
-void handleGillPacket(const uint8_t *mac, const protocol::GillControlPacket &packet) {
-  if (packet.magic != protocol::kGillPacketMagic) {
-    return;
-  }
-  if (!g_paired || std::memcmp(mac, g_controllerMac, sizeof(g_controllerMac)) != 0) {
+  if (command.magic != kDriveCommandMagic) {
     return;
   }
 
-  storeDriveCommand(convertGillPacket(packet));
+  g_lastCommand = command;
+  g_lastTimestamp = millis();
 }
 
 void onDataRecv(const uint8_t *mac, const uint8_t *incomingData, int len) {
-    Serial.println("I catched something from the air!");
   if (mac == nullptr || incomingData == nullptr || len <= 0) {
     return;
   }
 
-  if (len == static_cast<int>(sizeof(protocol::IdentityMessage))) {
-    handleIdentityMessage(mac, *reinterpret_cast<const protocol::IdentityMessage *>(incomingData));
+  if (len == static_cast<int>(sizeof(IdentityMessage))) {
+    handleIdentityMessage(mac, *reinterpret_cast<const IdentityMessage *>(incomingData));
     return;
   }
 
-  if (len == static_cast<int>(sizeof(protocol::GillControlPacket))) {
-    handleGillPacket(mac, *reinterpret_cast<const protocol::GillControlPacket *>(incomingData));
-    return;
-  }
-
-  if (len == static_cast<int>(sizeof(protocol::ControlMessage))) {
-    handleControlMessage(mac, *reinterpret_cast<const protocol::ControlMessage *>(incomingData));
+  if (len == static_cast<int>(sizeof(DriveCommand))) {
+    storeDriveCommand(mac, *reinterpret_cast<const DriveCommand *>(incomingData));
   }
 }
 
@@ -199,13 +144,7 @@ const uint8_t kBroadcastMac[6] = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
 
 bool init(const char *ssid, const char *password, uint8_t channel) {
   g_channel = channel;
-  g_paired = false;
-  g_lastTimestamp = 0;
-  g_syntheticSequence = 0;
-  g_lastHandshakeMs = 0;
-  std::memset(&g_lastCommand, 0, sizeof(g_lastCommand));
-  std::memset(g_controllerMac, 0, sizeof(g_controllerMac));
-  std::memset(g_controllerIdentity, 0, sizeof(g_controllerIdentity));
+  resetState();
 
   WiFi.mode(WIFI_AP_STA);
   WiFi.setTxPower(WIFI_POWER_8_5dBm);
@@ -213,11 +152,19 @@ bool init(const char *ssid, const char *password, uint8_t channel) {
   WiFi.softAP(ssid, password, channel);
 
   if (esp_now_init() != ESP_OK) {
-      Serial.println("ESP now failed to init..");
+    Serial.println("Failed to initialize ESP-NOW");
     return false;
   }
 
-  ensurePeer(kBroadcastMac);
+  if (!esp_now_is_peer_exist(kBroadcastMac)) {
+    esp_now_peer_info_t peerInfo{};
+    std::memcpy(peerInfo.peer_addr, kBroadcastMac, sizeof(peerInfo.peer_addr));
+    peerInfo.channel = channel;
+    peerInfo.encrypt = false;
+    peerInfo.ifidx = WIFI_IF_AP;
+    esp_now_add_peer(&peerInfo);
+  }
+
   esp_now_register_recv_cb(onDataRecv);
   return true;
 }
