@@ -5,7 +5,7 @@
 
 namespace config {
 
-constexpr const char kDeviceIdentity[] = "GillerT12";
+constexpr const char kDeviceIdentity[] = "THEGILL";
 constexpr const char kAccessPointSsid[] = "Thegill PORT";
 constexpr const char kAccessPointPassword[] = "ASCE321#";
 constexpr uint8_t kEspNowChannel = 6;
@@ -42,9 +42,11 @@ constexpr uint8_t kBuzzerPin = 47;
 constexpr uint8_t kBuzzerChannel = 0;
 constexpr uint8_t kBuzzerResolutionBits = 10;
 constexpr uint8_t kBuzzerMinResolutionBits = 4;
+
 constexpr uint16_t kBuzzerRetuneGuardMs = 6;
 constexpr uint16_t kBuzzerRetuneGuardMinDeltaHz = 12;
 constexpr uint8_t kBuzzerRetuneGuardDeltaPercent = 6;
+
 
 constexpr uint8_t kPwmResolutionBits = 8;
 constexpr uint16_t kPwmMaxDuty = (1U << kPwmResolutionBits) - 1U;

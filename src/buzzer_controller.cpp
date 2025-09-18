@@ -36,8 +36,10 @@ void BuzzerController::begin(uint8_t pin) {
   requestedFrequencyHz_ = 0;
   currentFrequencyHz_ = 0;
   currentResolutionBits_ = config::kBuzzerResolutionBits;
+
   pendingGuardStep_ = false;
   guardReleaseMs_ = 0;
+
 }
 
 void BuzzerController::update() {

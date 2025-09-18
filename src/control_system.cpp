@@ -9,7 +9,6 @@
 #include <status_led.h>
 #include <comms.h>
 #include <network_setup.h>
-#include <control_protocol.h>
 #include <control_system.h>
 
 namespace {
@@ -25,12 +24,6 @@ constexpr ToneStep kConnectedSequence[] = {
     {784, 160, 20},   // G5
     {988, 160, 30},   // B5
     {1175, 240, 160}, // D6
-};
-
-constexpr ToneStep kHonkSequence[] = {
-    {330, 280, 20},  // E4
-    {262, 180, 20},  // C4
-    {415, 360, 160}, // G#4
 };
 
 constexpr ToneStep kFailsafeSequence[] = {
@@ -175,27 +168,58 @@ void ControlSystem::updateTask() {
 }
 
 void ControlSystem::applyDriveCommand(const Comms::DriveCommand &command, uint32_t timestamp) {
-  if (command.version != protocol::kControlProtocolVersion) {
+  if (command.magic != Comms::kDriveCommandMagic) {
     return;
   }
 
-  const bool honk = (command.flags & protocol::kControlFlagHonk) != 0;
-
   exitFailsafe();
 
+  const bool armed = command.armMotors;
+
+  if (!armed) {
+    stopAllMotors();
+    lastCommandTimestamp_ = timestamp;
+    updateStatusForConnection();
+    return;
+  }
+
+  auto clamp = [](float value) {
+    if (value > 1.0f) {
+      return 1.0f;
+    }
+    if (value < -1.0f) {
+      return -1.0f;
+    }
+    return value;
+  };
+
+  const float throttle = (static_cast<int32_t>(command.throttle) - 500) / 500.0f;
+  const float yaw = static_cast<float>(command.yawAngle) / 90.0f;
+  const float pitch = static_cast<float>(command.pitchAngle) / 90.0f;
+  const float roll = static_cast<float>(command.rollAngle) / 90.0f;
+
+  const float leftBase = throttle - yaw;
+  const float rightBase = throttle + yaw;
+  const float frontAdjust = pitch;
+  const float rearAdjust = -pitch;
+  const float leftAdjust = -roll;
+  const float rightAdjust = roll;
+
+  const float mixes[4] = {
+      clamp(leftBase + frontAdjust + leftAdjust),
+      clamp(leftBase + rearAdjust + leftAdjust),
+      clamp(rightBase + frontAdjust + rightAdjust),
+      clamp(rightBase + rearAdjust + rightAdjust),
+  };
+
   for (std::size_t i = 0; i < config::kMotorCount; ++i) {
-    const float duty = static_cast<float>(command.motorDuty[i]) / 1000.0f;
-    const bool brake = (command.flags & protocol::BrakeFlagForMotor(i)) != 0;
-    motors_[i].applyCommand(duty, brake);
-    lastMotorCommands_[i] = brake ? 0.0f : duty;
+    const float duty = (i < 4) ? mixes[i] : clamp(throttle);
+    motors_[i].applyCommand(duty, false);
+    lastMotorCommands_[i] = duty;
   }
 
   lastCommandTimestamp_ = timestamp;
   updateStatusForConnection();
-
-  if (honk) {
-    buzzer_.playSequence(kHonkSequence, ToneSequenceLength(kHonkSequence));
-  }
 }
 
 void ControlSystem::stopAllMotors() {
