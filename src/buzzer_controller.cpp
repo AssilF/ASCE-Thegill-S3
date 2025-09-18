@@ -1,5 +1,13 @@
 #include "buzzer_controller.h"
 
+namespace {
+constexpr ToneStep kDefaultBootSequence[] = {
+    {784, 200, 30},  // G5
+    {988, 160, 30},  // B5
+    {1568, 180, 0},  // G6
+};
+} // namespace
+
 void BuzzerController::begin(uint8_t pin, uint8_t channel, uint8_t resolutionBits) {
   pinMode(pin, OUTPUT);
   ledcSetup(channel, 2000, resolutionBits);
@@ -57,6 +65,10 @@ void BuzzerController::stop() {
 }
 
 bool BuzzerController::isPlaying() const { return playing_; }
+
+void BuzzerController::playBootSequence(bool loop) {
+  playSequence(kDefaultBootSequence, ToneSequenceLength(kDefaultBootSequence), loop);
+}
 
 void BuzzerController::loadNextStep() {
   if (sequence_ == nullptr || length_ == 0) {
