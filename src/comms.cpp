@@ -1,27 +1,17 @@
 #include "comms.h"
 
-#include <Arduino.h>
-#include <WiFi.h>
-#include <esp_now.h>
-#include <freertos/FreeRTOS.h>
-#include <freertos/portmacro.h>
-
 #include <cstring>
-
-#include "device_config.h"
-#include "control_protocol.h"
 
 namespace Comms {
 namespace {
-volatile uint32_t g_lastCommandTimestamp = 0;
-DriveCommand g_lastCommand{};
+constexpr uint8_t kIdentityStringLength = sizeof(protocol::IdentityMessage::identity);
+
 bool g_paired = false;
+protocol::ControlMessage g_lastMessage{};
+uint32_t g_lastTimestamp = 0;
 uint8_t g_controllerMac[6] = {0};
-char g_controllerIdentity[sizeof(IdentityMessage::identity)] = {0};
+char g_controllerIdentity[kIdentityStringLength] = {0};
 uint8_t g_channel = 0;
-uint16_t g_lastBrakeMask = 0;
-bool g_lastFromIlite = false;
-portMUX_TYPE g_commandMutex = portMUX_INITIALIZER_UNLOCKED;
 
 void ensurePeer(const uint8_t *mac) {
   if (esp_now_is_peer_exist(mac)) {
@@ -29,20 +19,15 @@ void ensurePeer(const uint8_t *mac) {
   }
 
   esp_now_peer_info_t peerInfo{};
-  memcpy(peerInfo.peer_addr, mac, 6);
+  std::memcpy(peerInfo.peer_addr, mac, sizeof(peerInfo.peer_addr));
   peerInfo.channel = g_channel;
   peerInfo.encrypt = false;
   peerInfo.ifidx = WIFI_IF_AP;
   esp_now_add_peer(&peerInfo);
 }
 
-void addBroadcastPeer() {
-  static const uint8_t kBroadcastMac[6] = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
-  ensurePeer(kBroadcastMac);
-}
-
-void respondWithIdentity(const uint8_t *mac, PairingType type) {
-  IdentityMessage response{};
+void sendIdentity(const uint8_t *mac, protocol::MessageType type) {
+  protocol::IdentityMessage response{};
   response.type = static_cast<uint8_t>(type);
   std::strncpy(response.identity, config::kDeviceIdentity, sizeof(response.identity));
   response.identity[sizeof(response.identity) - 1] = '\0';
@@ -51,82 +36,36 @@ void respondWithIdentity(const uint8_t *mac, PairingType type) {
   esp_now_send(mac, reinterpret_cast<const uint8_t *>(&response), sizeof(response));
 }
 
-void handleGillControlPacket(const uint8_t *mac, const protocol::GillControlPacket &packet) {
-  if (packet.magic != protocol::kGillPacketMagic) {
-    return;
-  }
-
-  if (g_paired && std::memcmp(g_controllerMac, mac, sizeof(g_controllerMac)) != 0) {
-    return;
-  }
-
-  const uint32_t now = millis();
-  portENTER_CRITICAL(&g_commandMutex);
-  g_lastCommand = {packet.magic,
-                   packet.leftFront,
-                   packet.leftRear,
-                   packet.rightFront,
-                   packet.rightRear,
-                   packet.easingRate,
-                   packet.mode,
-                   packet.easing,
-                   packet.flags,
-                   packet.reserved};
-  g_lastBrakeMask = 0;
-  g_lastFromIlite = false;
-  g_lastCommandTimestamp = now;
-  portEXIT_CRITICAL(&g_commandMutex);
-
-  if (!g_paired) {
+void handleIdentityMessage(const uint8_t *mac, const protocol::IdentityMessage &message) {
+  const auto msgType = static_cast<protocol::MessageType>(message.type);
+  switch (msgType) {
+  case protocol::MessageType::kScanRequest:
+    sendIdentity(mac, protocol::MessageType::kDroneIdentity);
+    break;
+  case protocol::MessageType::kControllerIdentity:
     std::memcpy(g_controllerMac, mac, sizeof(g_controllerMac));
+    std::strncpy(g_controllerIdentity, message.identity, sizeof(g_controllerIdentity));
+    g_controllerIdentity[sizeof(g_controllerIdentity) - 1] = '\0';
+    ensurePeer(mac);
+    sendIdentity(mac, protocol::MessageType::kDroneAck);
     g_paired = true;
+    break;
+  default:
+    break;
   }
 }
 
-void handleIliteControlPacket(const uint8_t *mac, const protocol::ControlMessage &packet) {
-  if (packet.type != static_cast<uint8_t>(protocol::MessageType::kControlCommand) ||
-      packet.version != protocol::kControlProtocolVersion) {
+void handleControlMessage(const uint8_t *mac, const protocol::ControlMessage &message) {
+  (void)mac;
+  if (message.type != static_cast<uint8_t>(protocol::MessageType::kControlCommand)) {
+    return;
+  }
+  if (message.version != protocol::kControlProtocolVersion) {
     return;
   }
 
-  if (g_paired && std::memcmp(g_controllerMac, mac, sizeof(g_controllerMac)) != 0) {
-    return;
-  }
-
-  DriveCommand translated{};
-  translated.magic = kDrivePacketMagic;
-  translated.leftFront = packet.motorDuty[0];
-  translated.leftRear = packet.motorDuty[1];
-  translated.rightFront = packet.motorDuty[2];
-  translated.rightRear = packet.motorDuty[3];
-  translated.easingRate = 0.0f;
-  translated.mode = 0;
-  translated.easing = 0;
-  translated.flags = 0;
-  if (packet.flags & protocol::kControlFlagHonk) {
-    translated.flags |= kDriveFlagHonk;
-  }
-  translated.reserved = 0;
-
-  uint16_t brakeMask = 0;
-  for (std::size_t i = 0; i < config::kMotorCount; ++i) {
-    if (packet.flags & protocol::BrakeFlagForMotor(i)) {
-      brakeMask |= static_cast<uint16_t>(1U << i);
-    }
-  }
-
-  const uint32_t now = millis();
-  portENTER_CRITICAL(&g_commandMutex);
-  g_lastCommand = translated;
-  g_lastBrakeMask = brakeMask;
-  g_lastFromIlite = true;
-  g_lastCommandTimestamp = now;
-  portEXIT_CRITICAL(&g_commandMutex);
-
-  if (!g_paired) {
-    std::memcpy(g_controllerMac, mac, sizeof(g_controllerMac));
-    g_paired = true;
-  }
+  g_lastMessage = message;
+  g_lastTimestamp = millis();
 }
 
 void onDataRecv(const uint8_t *mac, const uint8_t *incomingData, int len) {
@@ -134,98 +73,56 @@ void onDataRecv(const uint8_t *mac, const uint8_t *incomingData, int len) {
     return;
   }
 
-  if (len == static_cast<int>(sizeof(IdentityMessage))) {
-    const auto *msg = reinterpret_cast<const IdentityMessage *>(incomingData);
-    switch (static_cast<PairingType>(msg->type)) {
-    case kScanRequest:
-      respondWithIdentity(mac, kDroneIdentity);
-      return;
-    case kControllerIdentity:
-      memcpy(g_controllerMac, mac, sizeof(g_controllerMac));
-      std::strncpy(g_controllerIdentity, msg->identity, sizeof(g_controllerIdentity));
-      g_controllerIdentity[sizeof(g_controllerIdentity) - 1] = '\0';
-      ensurePeer(mac);
-      respondWithIdentity(mac, kDroneAck);
-      g_paired = true;
-      return;
-    default:
-      break;
-    }
-  }
-
-  if (len == static_cast<int>(sizeof(protocol::GillControlPacket))) {
-    handleGillControlPacket(mac, *reinterpret_cast<const protocol::GillControlPacket *>(incomingData));
-    return;
-  }
-
-  if (len == static_cast<int>(sizeof(DriveCommand))) {
-    const auto *cmd = reinterpret_cast<const DriveCommand *>(incomingData);
-    if (cmd->magic != kDrivePacketMagic) {
-      return;
-    }
-    if (g_paired && std::memcmp(g_controllerMac, mac, sizeof(g_controllerMac)) != 0) {
-      return;
-    }
-
-    const uint32_t now = millis();
-    portENTER_CRITICAL(&g_commandMutex);
-    g_lastCommand = *cmd;
-    g_lastBrakeMask = 0;
-    g_lastFromIlite = false;
-    g_lastCommandTimestamp = now;
-    portEXIT_CRITICAL(&g_commandMutex);
-
-    if (!g_paired) {
-      memcpy(g_controllerMac, mac, sizeof(g_controllerMac));
-      g_paired = true;
-    }
+  if (len == static_cast<int>(sizeof(protocol::IdentityMessage))) {
+    handleIdentityMessage(mac, *reinterpret_cast<const protocol::IdentityMessage *>(incomingData));
     return;
   }
 
   if (len == static_cast<int>(sizeof(protocol::ControlMessage))) {
-    handleIliteControlPacket(mac, *reinterpret_cast<const protocol::ControlMessage *>(incomingData));
+    handleControlMessage(mac, *reinterpret_cast<const protocol::ControlMessage *>(incomingData));
   }
 }
 
 } // namespace
 
+const uint8_t kBroadcastMac[6] = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
+
 bool init(const char *ssid, const char *password, uint8_t channel) {
   g_channel = channel;
   g_paired = false;
-  g_lastCommandTimestamp = 0;
-  std::memset(&g_lastCommand, 0, sizeof(g_lastCommand));
+  g_lastTimestamp = 0;
+  std::memset(&g_lastMessage, 0, sizeof(g_lastMessage));
   std::memset(g_controllerMac, 0, sizeof(g_controllerMac));
   std::memset(g_controllerIdentity, 0, sizeof(g_controllerIdentity));
-  g_lastBrakeMask = 0;
-  g_lastFromIlite = false;
 
   WiFi.mode(WIFI_AP_STA);
   WiFi.setSleep(false);
-  WiFi.setHostname(config::kDeviceIdentity);
   WiFi.softAP(ssid, password, channel);
 
   if (esp_now_init() != ESP_OK) {
     return false;
   }
 
-  addBroadcastPeer();
+  ensurePeer(kBroadcastMac);
   esp_now_register_recv_cb(onDataRecv);
+  return true;
+}
+
+bool receiveCommand(DriveCommand &cmd) {
+  if (!g_paired || g_lastTimestamp == 0) {
+    return false;
+  }
+
+  cmd.sequence = g_lastMessage.sequence;
+  cmd.version = g_lastMessage.version;
+  std::memcpy(cmd.motorDuty, g_lastMessage.motorDuty, sizeof(cmd.motorDuty));
+  cmd.flags = g_lastMessage.flags;
   return true;
 }
 
 bool paired() { return g_paired; }
 
-bool receiveCommand(Command &command) {
-  portENTER_CRITICAL(&g_commandMutex);
-  command.drive = g_lastCommand;
-  command.brakeMask = g_lastBrakeMask;
-  command.fromIlite = g_lastFromIlite;
-  const bool valid = g_paired && g_lastCommand.magic == kDrivePacketMagic && g_lastCommandTimestamp != 0;
-  portEXIT_CRITICAL(&g_commandMutex);
-  return valid;
-}
-
-uint32_t lastCommandTimestamp() { return g_lastCommandTimestamp; }
+uint32_t lastCommandTimestamp() { return g_lastTimestamp; }
 
 const uint8_t *controllerMac() { return g_controllerMac; }
 

@@ -21,7 +21,7 @@ private:
   static void UpdateTaskTrampoline(void *param);
 
   void updateTask();
-  void applyDriveCommand(const Comms::Command &command, uint32_t timestamp);
+  void applyDriveCommand(const Comms::DriveCommand &command, uint32_t timestamp);
   void stopAllMotors();
   void enterFailsafe();
   void exitFailsafe();

@@ -4,6 +4,8 @@
 #include <WiFi.h>
 #include <math.h>
 
+#include "control_protocol.h"
+
 namespace {
 constexpr ToneStep kPairingSequence[] = {
     {1319, 120, 20}, // E6
@@ -96,7 +98,7 @@ void ControlSystem::UpdateTaskTrampoline(void *param) {
 }
 
 void ControlSystem::updateTask() {
-  Comms::Command command{};
+  Comms::DriveCommand command{};
   uint32_t lastAppliedTimestamp = 0;
 
   while (true) {
@@ -141,31 +143,20 @@ void ControlSystem::updateTask() {
   }
 }
 
-void ControlSystem::applyDriveCommand(const Comms::Command &command, uint32_t timestamp) {
-  const auto &drive = command.drive;
-  if (drive.magic != Comms::kDrivePacketMagic) {
+void ControlSystem::applyDriveCommand(const Comms::DriveCommand &command, uint32_t timestamp) {
+  if (command.version != protocol::kControlProtocolVersion) {
     return;
   }
 
-  const bool brakeAll = (drive.flags & Comms::kDriveFlagBrake) != 0;
-  const bool honk = (drive.flags & Comms::kDriveFlagHonk) != 0;
-
-  const int16_t motorValues[] = {drive.leftFront, drive.leftRear, drive.rightFront, drive.rightRear};
-  constexpr std::size_t kDriveMotorCount = sizeof(motorValues) / sizeof(motorValues[0]);
+  const bool honk = (command.flags & protocol::kControlFlagHonk) != 0;
 
   exitFailsafe();
 
   for (std::size_t i = 0; i < config::kMotorCount; ++i) {
-    float value = 0.0f;
-    if (i < kDriveMotorCount) {
-      value = static_cast<float>(motorValues[i]) / 1000.0f;
-    }
-    bool motorBrake = brakeAll;
-    if (command.fromIlite) {
-      motorBrake = (command.brakeMask & static_cast<uint16_t>(1U << i)) != 0;
-    }
-    motors_[i].applyCommand(value, motorBrake);
-    lastMotorCommands_[i] = motorBrake ? 0.0f : value;
+    const float duty = static_cast<float>(command.motorDuty[i]) / 1000.0f;
+    const bool brake = (command.flags & protocol::BrakeFlagForMotor(i)) != 0;
+    motors_[i].applyCommand(duty, brake);
+    lastMotorCommands_[i] = brake ? 0.0f : duty;
   }
 
   lastCommandTimestamp_ = timestamp;

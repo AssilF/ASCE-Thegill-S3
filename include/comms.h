@@ -1,51 +1,29 @@
 #pragma once
 
-#include <cstdint>
+#include <Arduino.h>
+#include <WiFi.h>
+#include <esp_now.h>
+
+#include "control_protocol.h"
+#include "device_config.h"
 
 namespace Comms {
 
-constexpr uint32_t kDrivePacketMagic = 0x54474C4C; // 'TGLL'
-constexpr uint8_t kDriveFlagBrake = 0x01;
-constexpr uint8_t kDriveFlagHonk = 0x02;
-
 struct DriveCommand {
-  uint32_t magic;
-  int16_t leftFront;
-  int16_t leftRear;
-  int16_t rightFront;
-  int16_t rightRear;
-  float easingRate;
-  uint8_t mode;
-  uint8_t easing;
-  uint8_t flags;
-  uint8_t reserved;
-} __attribute__((packed));
-
-struct Command {
-  DriveCommand drive;
-  uint16_t brakeMask;
-  bool fromIlite;
+  uint32_t sequence;
+  uint8_t version;
+  int16_t motorDuty[config::kMotorCount];
+  uint16_t flags;
 };
-
-enum PairingType : uint8_t {
-  kScanRequest = 0x01,
-  kDroneIdentity = 0x02,
-  kControllerIdentity = 0x03,
-  kDroneAck = 0x04,
-};
-
-struct IdentityMessage {
-  uint8_t type;
-  char identity[16];
-  uint8_t mac[6];
-} __attribute__((packed));
 
 bool init(const char *ssid, const char *password, uint8_t channel);
+bool receiveCommand(DriveCommand &cmd);
 bool paired();
-bool receiveCommand(Command &command);
 uint32_t lastCommandTimestamp();
 const uint8_t *controllerMac();
 const char *controllerIdentity();
+
+extern const uint8_t kBroadcastMac[6];
 
 } // namespace Comms
 
