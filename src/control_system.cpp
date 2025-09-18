@@ -1,10 +1,8 @@
-#include "control_system.h"
-#include "device_config.h"
+#include <device_config.h>
 #include <Arduino.h>
 #include <WiFi.h>
 #include <math.h>
 
-#include "control_protocol.h"
 
 namespace {
 constexpr ToneStep kPairingSequence[] = {

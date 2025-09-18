@@ -4,7 +4,6 @@
 #include <WiFi.h>
 #include <esp_now.h>
 
-#include "control_protocol.h"
 #include "device_config.h"
 
 namespace Comms {
