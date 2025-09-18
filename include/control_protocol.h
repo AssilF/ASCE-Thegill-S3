@@ -61,3 +61,4 @@ inline constexpr uint16_t BrakeFlagForMotor(std::size_t index) {
 }
 
 } // namespace protocol
+
