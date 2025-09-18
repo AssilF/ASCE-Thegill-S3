@@ -1,32 +1,37 @@
 #pragma once
-
 #include <Arduino.h>
 #include <WiFi.h>
 #include <esp_now.h>
-
-#include "device_config.h"
+#include "thegill.h"
 
 namespace Comms {
-
-constexpr uint32_t kDriveCommandMagic = 0xA1B2C3D4;
-
-struct DriveCommand {
-  uint32_t magic = kDriveCommandMagic;
-  uint16_t throttle = 0;
-  int8_t pitchAngle = 0;
-  int8_t rollAngle = 0;
-  int8_t yawAngle = 0;
-  bool armMotors = false;
+struct TelemetryPacket {
+  uint32_t magic;                // Should be PACKET_MAGIC
+  float pitch, roll, yaw;        // Orientation in degrees
+  float leftFrontActual, leftRearActual, rightFrontActual; // Normalized motor outputs
+  uint16_t rightRearActual;      // Encoded right-rear output (0-2000 => -1000..1000)
+  int8_t leftFrontTarget, rightFrontTarget, leftRearTarget; // Target commands compressed to int8
+  float verticalAcc;             // Vertical acceleration in m/s^2
+  uint32_t commandAge;           // Age of last command in ms
 } __attribute__((packed));
 
-bool init(const char *ssid, const char *password, uint8_t channel);
-bool receiveCommand(DriveCommand &cmd);
+enum PairingType : uint8_t {
+    SCAN_REQUEST = 0x01,
+    DRONE_IDENTITY = 0x02,
+    ILITE_IDENTITY = 0x03,
+    DRONE_ACK = 0x04,
+};
+
+struct IdentityMessage {
+    uint8_t type;
+    char identity[16];
+    uint8_t mac[6];
+} __attribute__((packed));
+
+bool init(const char *ssid, const char *password, int tcpPort);
+bool init(const char *ssid, const char *password, int tcpPort, esp_now_recv_cb_t recvCallback);
+bool receiveCommand(ThegillCommand &cmd);
 bool paired();
-uint32_t lastCommandTimestamp();
-const uint8_t *controllerMac();
-const char *controllerIdentity();
-
-extern const uint8_t kBroadcastMac[6];
-
-} // namespace Comms
+extern const uint8_t BroadcastMac[6];
+}
 
