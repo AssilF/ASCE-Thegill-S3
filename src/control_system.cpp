@@ -170,6 +170,7 @@ void ControlSystem::handleControllerIdentity(const uint8_t *mac,
     }
   }
 
+
   const bool addressedToUs = payloadMacValid && memcmp(message.mac, selfMac_, sizeof(selfMac_)) == 0;
   if (payloadMacValid && !addressedToUs) {
     Serial.println("Controller identity payload MAC does not match this drone");
@@ -177,8 +178,9 @@ void ControlSystem::handleControllerIdentity(const uint8_t *mac,
 
   const bool sameController = pairingState_.paired && memcmp(pairingState_.controllerMac, mac, 6) == 0;
 
+
   if (!sameController) {
-    memcpy(pairingState_.controllerMac, mac, 6);
+    memcpy(pairingState_.controllerMac, storedMac, 6);
     strlcpy(pairingState_.controllerName, message.identity, sizeof(pairingState_.controllerName));
     pairingState_.paired = true;
     lastControlTimestamp_ = now;
@@ -188,6 +190,7 @@ void ControlSystem::handleControllerIdentity(const uint8_t *mac,
     ensurePeer(mac);
     Serial.printf("Paired with controller %s (%02X:%02X:%02X:%02X:%02X:%02X)\n", pairingState_.controllerName, mac[0],
                   mac[1], mac[2], mac[3], mac[4], mac[5]);
+
     buzzer_.playSequence(kConnectedSequence, ToneSequenceLength(kConnectedSequence));
     updateStatusForConnection();
   } else {
@@ -197,7 +200,9 @@ void ControlSystem::handleControllerIdentity(const uint8_t *mac,
     lastControlTimestamp_ = now;
   }
 
+
   if (sendIdentityMessage(mac, protocol::MessageType::kDroneAck)) {
+
     lastHandshakeTimestamp_ = now;
   }
 }
