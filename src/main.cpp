@@ -21,7 +21,7 @@
 const Motor::DriverPins PINS_LEFT_FRONT  = {4, 5, -1};
 const Motor::DriverPins PINS_LEFT_REAR   = {6, 7, -1};
 const Motor::DriverPins PINS_RIGHT_FRONT = {8, 9, -1};
-const Motor::DriverPins PINS_RIGHT_REAR  = {10, 11, -1};
+const Motor::DriverPins PINS_RIGHT_REAR  = {15, 16, -1};
 const int BUZZER_PIN = 12; // optional piezo buzzer
 const uint32_t CPU_FREQ_MHZ = 240;
 const uint16_t FAST_TASK_STACK = 4096;
@@ -57,7 +57,7 @@ const float GYRO_SCALE = 131.0; // LSB/°/s for ±250°/s
 const float rad_to_deg = 180.0 / PI;
 
 bool failsafe_enable = true;
-bool isArmed = false;
+bool isArmed = true;
 
 bool enableFilters = false; // Enable or disable filters
 bool enableQuadFilters = false;
@@ -618,7 +618,7 @@ void FastTask(void *pvParameters) {
         gillTelemetry.honkActive = honk;
 
         if (honk && BUZZER_PIN >= 0) {
-            beep(2000, 120);
+            beep(400, 10);
         }
 
         bool steep = fabs(pitch) > TIPOVER_ANGLE || fabs(roll) > TIPOVER_ANGLE;
