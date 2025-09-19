@@ -295,6 +295,33 @@ void BuzzerTask(void *pvParameters)
     }
 }
 
+static void runMotorStartupTest()
+{
+    Serial.println("Running motor startup self-test...");
+
+    Motor::Outputs testOutputs{300, 300, 300, 300};
+    Motor::Outputs stopOutputs{0, 0, 0, 0};
+
+    targetOutputs = testOutputs;
+    uint32_t endTime = millis() + 1000; // run motors for 1 second
+    while (millis() < endTime)
+    {
+        Motor::update(true, currentOutputs, targetOutputs);
+        delay(10);
+    }
+
+    targetOutputs = stopOutputs;
+    endTime = millis() + 250; // allow outputs to ramp back to zero smoothly
+    while (millis() < endTime)
+    {
+        Motor::update(true, currentOutputs, targetOutputs);
+        delay(10);
+    }
+
+    Motor::update(false, currentOutputs, targetOutputs);
+    Serial.println("Motor startup self-test complete.");
+}
+
 void streamTelemetry()
 {
     if (millis() - lastTelemetry < TELEMETRY_INTERVAL)
@@ -713,6 +740,8 @@ void setup()
     storeCommandSnapshot(initialCommand);
     targetOutputs = {0, 0, 0, 0};
     Motor::update(false, currentOutputs, targetOutputs);
+
+    runMotorStartupTest();
 
 
     // Initialize IMU
