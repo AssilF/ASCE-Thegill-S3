@@ -8,6 +8,7 @@
 #include <freertos/task.h>
 #include <freertos/portmacro.h>
 #include <cstring>
+#include <ctype.h>
 #include "comms.h"
 #include "commands.h"
 #include "thegill.h"
@@ -241,6 +242,59 @@ void beep(uint16_t freq, uint16_t duration)
     xQueueSend(buzzerQueue, &cmd, 0);
 }
 
+static bool identityContains(const Comms::IdentityMessage &msg, const char *needle)
+{
+    const size_t maxLen = sizeof(msg.identity);
+    const size_t needleLen = strlen(needle);
+    if (needleLen == 0 || needleLen > maxLen)
+        return false;
+
+    for (size_t start = 0; start + needleLen <= maxLen; ++start)
+    {
+        if (msg.identity[start] == '\0')
+            break;
+
+        bool match = true;
+        for (size_t i = 0; i < needleLen; ++i)
+        {
+            size_t idx = start + i;
+            if (idx >= maxLen)
+            {
+                match = false;
+                break;
+            }
+            char actual = msg.identity[idx];
+            if (actual == '\0')
+            {
+                match = false;
+                break;
+            }
+            char expected = needle[i];
+            actual = toupper(static_cast<unsigned char>(actual));
+            expected = toupper(static_cast<unsigned char>(expected));
+            if (actual != expected)
+            {
+                match = false;
+                break;
+            }
+        }
+        if (match)
+            return true;
+    }
+    return false;
+}
+
+static bool isEliteControllerIdentity(const Comms::IdentityMessage &msg)
+{
+    if (msg.type == Comms::ILITE_IDENTITY || msg.type == Comms::ELITE_IDENTITY)
+        return true;
+    if (identityContains(msg, "ELITE"))
+        return true;
+    if (identityContains(msg, "ILITE"))
+        return true;
+    return false;
+}
+
 void BuzzerTask(void *pvParameters)
 {
     BuzzerCommand cmd;
@@ -304,7 +358,7 @@ void streamTelemetry()
         commandAge
     };
 
-    // Send telemetry to ILITE ground station if paired
+    // Send telemetry to ELITE/ILITE ground station if paired
     if (linkState.ilitePaired)
     {
         esp_now_send(linkState.iliteMac, (uint8_t *)&packet, sizeof(packet));
@@ -422,7 +476,7 @@ void onReceive(const uint8_t *mac, const uint8_t *incomingData, int len)
         }
 
 
-        else if (msg.type == Comms::ILITE_IDENTITY)
+        else if (isEliteControllerIdentity(msg))
         {
             uint8_t existingMac[6];
             bool wasPaired = copyIliteMacFromISR(existingMac);
