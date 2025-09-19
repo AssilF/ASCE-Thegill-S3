@@ -1,6 +1,6 @@
 #include "motor.h"
 #include <math.h>
-#include <driver/gpio.h>
+#include <Arduino.h>
 
 namespace Motor {
 namespace {
@@ -18,10 +18,11 @@ struct PwmState {
     volatile uint8_t activePin;
 };
 
-constexpr uint32_t PWM_MAX_FREQ = 20000;
-constexpr uint32_t PWM_MIN_FREQ = 400;
+constexpr uint32_t PWM_MAX_FREQ = 600;
+constexpr uint32_t PWM_MIN_FREQ = 250;
 constexpr uint32_t TIMER_BASE_FREQ = 1000000; // 1 MHz base for scheduling
-constexpr uint32_t DEFAULT_IDLE_INTERVAL = 1000; // microseconds
+constexpr uint32_t PWM_TARGET_FREQ = 400; // Hz, within 250-600 Hz band
+constexpr uint32_t DEFAULT_IDLE_INTERVAL = TIMER_BASE_FREQ / PWM_TARGET_FREQ;
 
 constexpr uint8_t PHASE_START = 0;
 constexpr uint8_t PHASE_END = 1;
@@ -34,24 +35,21 @@ constexpr uint8_t ACTIVE_REVERSE = 2;
 static DriverState drivers[4];
 static PwmState pwmStates[4];
 static bool subsystemInitialised = false;
-static float smoothingRate = 4.0f;
-
 static hw_timer_t *pwmTimer = nullptr;
 static portMUX_TYPE timerMux = portMUX_INITIALIZER_UNLOCKED;
 static volatile uint64_t currentTicks = 0;
 static volatile uint32_t alarmInterval = DEFAULT_IDLE_INTERVAL;
 
-inline void IRAM_ATTR setPinLevel(int pin, int level)
+inline void setPinLevel(int pin, int level)
 {
     if (pin >= 0) {
-        gpio_set_level(static_cast<gpio_num_t>(pin), level ? 1 : 0);
+        digitalWrite(pin, level ? HIGH : LOW);
     }
 }
 
-uint32_t computeFrequency(float magnitude)
+uint32_t computeFrequency()
 {
-    magnitude = constrain(magnitude, 0.0f, 1.0f);
-    return PWM_MIN_FREQ + static_cast<uint32_t>((PWM_MAX_FREQ - PWM_MIN_FREQ) * magnitude);
+    return constrain(PWM_TARGET_FREQ, PWM_MIN_FREQ, PWM_MAX_FREQ);
 }
 
 uint32_t computePeriodTicks(uint32_t freq)
@@ -152,18 +150,6 @@ void IRAM_ATTR onPwmTimer()
     portEXIT_CRITICAL_ISR(&timerMux);
 }
 
-int16_t easeToward(int16_t current, int16_t target)
-{
-    float stepF = constrain(smoothingRate * 40.0f, 10.0f, 400.0f);
-    int16_t step = static_cast<int16_t>(stepF);
-    if (current < target) {
-        int16_t next = current + step;
-        return next > target ? target : next;
-    }
-    int16_t next = current - step;
-    return next < target ? target : next;
-}
-
 void configureDriver(size_t index, const DriverPins &pins)
 {
     DriverState &state = drivers[index];
@@ -180,7 +166,7 @@ void configureDriver(size_t index, const DriverPins &pins)
         digitalWrite(pins.enablePin, LOW);
     }
 
-    pwmStates[index].periodTicks = computePeriodTicks(PWM_MIN_FREQ);
+    pwmStates[index].periodTicks = computePeriodTicks(computeFrequency());
     pwmStates[index].onTicks = 0;
     pwmStates[index].cycleStart = 0;
     pwmStates[index].nextEvent = DEFAULT_IDLE_INTERVAL;
@@ -195,9 +181,9 @@ void applyOutput(size_t index, int16_t command)
 
     float magnitude = fabsf(static_cast<float>(command) / 1000.0f);
     magnitude = constrain(magnitude, 0.0f, 1.0f);
-    uint32_t freq = computeFrequency(magnitude);
+    uint32_t freq = computeFrequency();
     uint32_t periodTicks = computePeriodTicks(freq);
-    uint32_t onTicks = static_cast<uint32_t>(static_cast<float>(periodTicks) * magnitude);
+    uint32_t onTicks = static_cast<uint32_t>(lroundf(static_cast<float>(periodTicks) * magnitude));
     if (onTicks > periodTicks) onTicks = periodTicks;
     if (magnitude > 0.0f && onTicks == 0) onTicks = 1;
 
@@ -286,16 +272,13 @@ void stop()
 void update(bool enabled, Outputs &current, const Outputs &target)
 {
     if (!subsystemInitialised) return;
-    Outputs next = current;
 
-    if (!enabled) {
-        next.leftFront = next.leftRear = next.rightFront = next.rightRear = 0;
-    } else {
-        next.leftFront = easeToward(current.leftFront, target.leftFront);
-        next.leftRear = easeToward(current.leftRear, target.leftRear);
-        next.rightFront = easeToward(current.rightFront, target.rightFront);
-        next.rightRear = easeToward(current.rightRear, target.rightRear);
+    Outputs next{};
+    if (enabled) {
+        next = target;
         next.constrainAll();
+    } else {
+        next.leftFront = next.leftRear = next.rightFront = next.rightRear = 0;
     }
 
     applyOutput(0, next.leftFront);
@@ -304,11 +287,6 @@ void update(bool enabled, Outputs &current, const Outputs &target)
     applyOutput(3, next.rightRear);
 
     current = next;
-}
-
-void setEasingRate(float rate)
-{
-    smoothingRate = constrain(rate, 0.5f, 20.0f);
 }
 
 } // namespace Motor

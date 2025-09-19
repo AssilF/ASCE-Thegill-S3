@@ -1,6 +1,5 @@
 #include <Arduino.h>
 #include <ArduinoOTA.h>
-#include <Wire.h>
 #include <WiFi.h>
 #include <WiFiClient.h>
 #include <esp_now.h>
@@ -9,11 +8,9 @@
 #include <freertos/task.h>
 #include <freertos/portmacro.h>
 #include <cstring>
-#include <math.h>
 #include "comms.h"
 #include "commands.h"
 #include "thegill.h"
-#include "imu.h"
 #include "motor.h"
 
 // ==================== BOARD CONFIGURATION ====================
@@ -49,18 +46,8 @@ const int16_t MOTOR_MIN = -1000;
 const int16_t MOTOR_MAX = 1000;
 const unsigned long FAILSAFE_TIMEOUT = 200;  // ms
 const unsigned long TELEMETRY_INTERVAL = 50; // ms
-const float TIPOVER_ANGLE = 36.0f; // degrees; sustained tilt before shutdown
-const unsigned long TIPOVER_DURATION = 700; // ms tilt must persist before disarm
-
-// IMU constants
-const float GYRO_SCALE = 131.0; // LSB/°/s for ±250°/s
-const float rad_to_deg = 180.0 / PI;
-
 bool failsafe_enable = true;
 bool isArmed = true;
-
-bool enableFilters = false; // Enable or disable filters
-bool enableQuadFilters = false;
 
 const char *DRONE_ID = "Thegill";
 const uint32_t PACKET_MAGIC = THEGILL_PACKET_MAGIC;
@@ -74,15 +61,11 @@ WiFiClient client;
 ThegillCommand command = {THEGILL_PACKET_MAGIC, 0, 0, 0, 0, 4.0f, GillMode::Default, GillEasing::EaseInOut, 0, 0};
 portMUX_TYPE commandMux = portMUX_INITIALIZER_UNLOCKED;
 portMUX_TYPE commsStateMux = portMUX_INITIALIZER_UNLOCKED;
-portMUX_TYPE imuZeroMux = portMUX_INITIALIZER_UNLOCKED;
 Motor::Outputs currentOutputs{0, 0, 0, 0};
 Motor::Outputs targetOutputs{0, 0, 0, 0};
 ThegillTelemetry gillTelemetry{};
-float pitch = 0, roll = 0, yaw = 0;
 unsigned long lastTelemetry = 0;
-unsigned long tipoverStart = 0;
 QueueHandle_t buzzerQueue = nullptr;
-static volatile bool imuZeroRequested = false;
 
 // ==================== COMMUNICATION FUNCTIONS ====================
 // Time in ms before we consider the controller disconnected
@@ -136,32 +119,6 @@ static inline void storeCommandSnapshotFromISR(const ThegillCommand &value)
     portENTER_CRITICAL_ISR(&commandMux);
     command = value;
     portEXIT_CRITICAL_ISR(&commandMux);
-}
-
-bool requestIMUZero()
-{
-    bool queued = false;
-    portENTER_CRITICAL(&imuZeroMux);
-    if (!imuZeroRequested)
-    {
-        imuZeroRequested = true;
-        queued = true;
-    }
-    portEXIT_CRITICAL(&imuZeroMux);
-    return queued;
-}
-
-static bool takeIMUZeroRequest()
-{
-    bool pending = false;
-    portENTER_CRITICAL(&imuZeroMux);
-    if (imuZeroRequested)
-    {
-        imuZeroRequested = false;
-        pending = true;
-    }
-    portEXIT_CRITICAL(&imuZeroMux);
-    return pending;
 }
 
 static inline LinkStateSnapshot loadLinkStateSnapshot()
@@ -335,7 +292,7 @@ void streamTelemetry()
 
     Comms::TelemetryPacket packet = {
         PACKET_MAGIC,
-        pitch, roll, yaw,
+        0.0f, 0.0f, 0.0f,
         currentOutputs.leftFront / 1000.0f,
         currentOutputs.leftRear / 1000.0f,
         currentOutputs.rightFront / 1000.0f,
@@ -343,7 +300,7 @@ void streamTelemetry()
         static_cast<int8_t>(constrain(targetOutputs.leftFront / 8, -128, 127)),
         static_cast<int8_t>(constrain(targetOutputs.rightFront / 8, -128, 127)),
         static_cast<int8_t>(constrain(targetOutputs.leftRear / 8, -128, 127)),
-        IMU::verticalAcc(),
+        0.0f,
         commandAge
     };
 
@@ -363,7 +320,7 @@ void streamTelemetry()
     if (!(telemetryEnabled && (serialActive || tcpActive)))
         return;
 
-    String telemetry = "TG:" + String(pitch, 2) + " " + String(roll, 2) + " " + String(yaw, 2) + " " +
+    String telemetry = "TG:0.00 0.00 0.00 " +
                        String(currentOutputs.leftFront) + " " + String(currentOutputs.leftRear) + " " +
                        String(currentOutputs.rightFront) + " " + String(currentOutputs.rightRear) + " " +
                        String(currentCommand.leftFront) + " " + String(currentCommand.leftRear) + " " +
@@ -569,22 +526,7 @@ void FastTask(void *pvParameters) {
     TickType_t lastWake = xTaskGetTickCount();
     const TickType_t interval = pdMS_TO_TICKS(2); // 500 Hz control loop
     while (true) {
-        IMU::update();
-        bool zeroApplied = false;
-        if (takeIMUZeroRequest()) {
-            IMU::applyOffsetFromCurrent();
-            zeroApplied = true;
-        }
-        pitch = IMU::pitch();
-        roll = IMU::roll();
-        yaw = IMU::yaw();
-
-        if (zeroApplied) {
-            Commands::sendLine("ACK: IMU zero complete");
-        }
-
         ThegillCommand currentCommand = loadCommandSnapshot();
-        Motor::setEasingRate(currentCommand.easingRate);
 
         Motor::Outputs desired{
             static_cast<int16_t>(constrain(currentCommand.leftFront, MOTOR_MIN, MOTOR_MAX)),
@@ -619,20 +561,6 @@ void FastTask(void *pvParameters) {
 
         if (honk && BUZZER_PIN >= 0) {
             beep(400, 10);
-        }
-
-        bool steep = fabs(pitch) > TIPOVER_ANGLE || fabs(roll) > TIPOVER_ANGLE;
-        if (isArmed && !brake && steep) {
-            if (tipoverStart == 0) {
-                tipoverStart = millis();
-            } else if (millis() - tipoverStart > TIPOVER_DURATION) {
-                isArmed = false;
-                tipoverStart = 0;
-                Motor::stop();
-                beep(1000, 200);
-            }
-        } else {
-            tipoverStart = 0;
         }
 
         vTaskDelayUntil(&lastWake, interval);
@@ -742,13 +670,6 @@ void setup()
     Motor::update(false, currentOutputs, targetOutputs);
 
     runMotorStartupTest();
-
-
-    // Initialize IMU
-    IMU::init();
-    pitch = IMU::pitch();
-    roll = IMU::roll();
-    yaw = IMU::yaw();
     setLastCommandTimeMs(millis());
 
     Serial.println("System ready for drive!");
