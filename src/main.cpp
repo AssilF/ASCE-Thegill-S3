@@ -45,7 +45,7 @@ const int TCP_PORT = 8000;
 // Motor and control constants
 const int16_t MOTOR_MIN = -1000;
 const int16_t MOTOR_MAX = 1000;
-const unsigned long FAILSAFE_TIMEOUT = 200;  // ms
+const unsigned long FAILSAFE_TIMEOUT = 500;  // ms
 const unsigned long TELEMETRY_INTERVAL = 50; // ms
 bool failsafe_enable = true;
 bool isArmed = true;
@@ -53,7 +53,11 @@ bool isArmed = true;
 const char *DRONE_ID = "Thegill";
 const uint32_t PACKET_MAGIC = THEGILL_PACKET_MAGIC;
 
-struct BuzzerCommand { uint16_t freq; uint16_t duration; };
+struct BuzzerCommand {
+    uint16_t durationMs;
+    uint8_t freqCount;
+    uint16_t freqs[3];
+};
 
 // ==================== GLOBAL VARIABLES ====================
 // Hardware
@@ -234,12 +238,26 @@ static void handleBufferedCharacter(char c)
     Commands::sendLine("ERROR: Message too long");
 }
 
+static void enqueueChord(const uint16_t *freqs, size_t count, uint16_t durationMs)
+{
+    if (BUZZER_PIN < 0 || !buzzerQueue || !freqs || count == 0)
+        return;
+
+    BuzzerCommand cmd{};
+    cmd.durationMs = durationMs;
+    cmd.freqCount = count > 3 ? 3 : static_cast<uint8_t>(count);
+    for (size_t i = 0; i < cmd.freqCount; ++i)
+    {
+        cmd.freqs[i] = freqs[i];
+    }
+
+    xQueueSend(buzzerQueue, &cmd, 0);
+}
+
 void beep(uint16_t freq, uint16_t duration)
 {
-    if (BUZZER_PIN < 0 || !buzzerQueue)
-        return;
-    BuzzerCommand cmd{freq, duration};
-    xQueueSend(buzzerQueue, &cmd, 0);
+    const uint16_t single[1] = {freq};
+    enqueueChord(single, 1, duration);
 }
 
 static bool identityContains(const Comms::IdentityMessage &msg, const char *needle)
@@ -300,8 +318,38 @@ void BuzzerTask(void *pvParameters)
     BuzzerCommand cmd;
     while (xQueueReceive(buzzerQueue, &cmd, portMAX_DELAY))
     {
-        ledcWriteTone(BUZZER_CHANNEL, cmd.freq);
-        vTaskDelay(pdMS_TO_TICKS(cmd.duration));
+        if (cmd.freqCount == 0 || cmd.durationMs == 0)
+        {
+            ledcWrite(BUZZER_CHANNEL, 0);
+            continue;
+        }
+
+        if (cmd.freqCount == 1)
+        {
+            ledcWriteTone(BUZZER_CHANNEL, cmd.freqs[0]);
+            vTaskDelay(pdMS_TO_TICKS(cmd.durationMs));
+        }
+        else
+        {
+            TickType_t totalTicks = pdMS_TO_TICKS(cmd.durationMs);
+            if (totalTicks == 0)
+                totalTicks = 1;
+            TickType_t slice = pdMS_TO_TICKS(10);
+            if (slice == 0)
+                slice = 1;
+            TickType_t elapsed = 0;
+            uint8_t index = 0;
+            while (elapsed < totalTicks)
+            {
+                ledcWriteTone(BUZZER_CHANNEL, cmd.freqs[index]);
+                TickType_t remaining = totalTicks - elapsed;
+                TickType_t waitTicks = remaining < slice ? remaining : slice;
+                vTaskDelay(waitTicks);
+                elapsed += waitTicks;
+                index = (index + 1) % cmd.freqCount;
+            }
+        }
+
         ledcWrite(BUZZER_CHANNEL, 0);
     }
 }
@@ -310,25 +358,36 @@ static void runMotorStartupTest()
 {
     Serial.println("Running motor startup self-test...");
 
+<<<<<<< HEAD
     Motor::Outputs testOutputs{-300, 300, 300, 300};
     Motor::Outputs stopOutputs{0, 0, 0, 0};
+=======
+    const int16_t maxTestOutput = 300;
+    const int16_t step = 50;
+    const uint16_t stepDelayMs = 50;
+>>>>>>> bb1c51d3ad3b95c99d57d4724e247c84f1fa19dd
 
-    targetOutputs = testOutputs;
-    uint32_t endTime = millis() + 1000; // run motors for 1 second
-    while (millis() < endTime)
+    Motor::Outputs outputs{0, 0, 0, 0};
+
+    for (int16_t value = 0; value <= maxTestOutput; value += step)
     {
+        outputs.leftFront = outputs.leftRear = outputs.rightFront = outputs.rightRear = value;
+        targetOutputs = outputs;
         Motor::update(true, currentOutputs, targetOutputs);
-        delay(10);
+        delay(stepDelayMs);
     }
 
-    targetOutputs = stopOutputs;
-    endTime = millis() + 250; // allow outputs to ramp back to zero smoothly
-    while (millis() < endTime)
+    delay(200);
+
+    for (int16_t value = maxTestOutput; value >= 0; value -= step)
     {
+        outputs.leftFront = outputs.leftRear = outputs.rightFront = outputs.rightRear = value;
+        targetOutputs = outputs;
         Motor::update(true, currentOutputs, targetOutputs);
-        delay(10);
+        delay(stepDelayMs);
     }
 
+    targetOutputs = {0, 0, 0, 0};
     Motor::update(false, currentOutputs, targetOutputs);
     Serial.println("Motor startup self-test complete.");
 }
@@ -542,35 +601,58 @@ void onReceive(const uint8_t *mac, const uint8_t *incomingData, int len)
 }
 
 void checkFailsafe() {
-    static unsigned long lastAlarmTime = 0;
-    if (!failsafe_enable) return;
+    if (!failsafe_enable)
+        return;
 
+    static bool rampingDown = false;
+    static uint32_t lastRampUpdate = 0;
     LinkStateSnapshot linkState = loadLinkStateSnapshot();
     uint32_t nowMs = millis();
     uint32_t lastCommandMs = linkState.lastCommandTimeMs;
 
-    if (lastCommandMs == 0 || nowMs - lastCommandMs > FAILSAFE_TIMEOUT) {
-        ThegillCommand safe = loadCommandSnapshot();
-        safe.leftFront = 0;
-        safe.leftRear = 0;
-        safe.rightFront = 0;
-        safe.rightRear = 0;
-        safe.flags |= GILL_FLAG_BRAKE;
+    if (lastCommandMs != 0 && nowMs - lastCommandMs <= FAILSAFE_TIMEOUT) {
+        rampingDown = false;
+        return;
+    }
+
+    if (!rampingDown)
+    {
+        rampingDown = true;
+        lastRampUpdate = nowMs;
+    }
+
+    const uint32_t rampIntervalMs = 50;
+    if (nowMs - lastRampUpdate < rampIntervalMs)
+        return;
+    lastRampUpdate = nowMs;
+
+    ThegillCommand safe = loadCommandSnapshot();
+    bool changed = false;
+
+    auto rampValue = [&](int16_t &value) {
+        int16_t original = value;
+        if (value > 0) {
+            int16_t next = value - 20;
+            value = next < 0 ? 0 : next;
+        } else if (value < 0) {
+            int16_t next = value + 20;
+            value = next > 0 ? 0 : next;
+        }
+        if (value != original)
+            changed = true;
+    };
+
+    rampValue(safe.leftFront);
+    rampValue(safe.leftRear);
+    rampValue(safe.rightFront);
+    rampValue(safe.rightRear);
+
+    if (changed) {
         storeCommandSnapshot(safe);
-        targetOutputs = {0, 0, 0, 0};
-        gillTelemetry.brakeActive = true;
-        gillTelemetry.honkActive = false;
-        isArmed = false;
-        Motor::stop();
-        if (BUZZER_PIN >= 0 && millis() - lastAlarmTime > 3000) {
-            beep(800, 200);
-            lastAlarmTime = millis();
-        }
-        static unsigned long lastMessage = 0;
-        if (millis() - lastMessage > 5000) {
-            Commands::sendLine("FAILSAFE: Command link lost");
-            lastMessage = millis();
-        }
+        Motor::Outputs newOutputs{safe.leftFront, safe.leftRear, safe.rightFront, safe.rightRear};
+        targetOutputs = newOutputs;
+    } else {
+        rampingDown = false;
     }
 }
 
@@ -590,7 +672,7 @@ void FastTask(void *pvParameters) {
         };
 
         bool brake = (currentCommand.flags & GILL_FLAG_BRAKE) != 0;
-        bool honk = (currentCommand.flags & GILL_FLAG_HONK) != 0;
+        bool honkFlag = (currentCommand.flags & GILL_FLAG_HONK) != 0;
         if (!isArmed || brake) {
             desired.leftFront = 0;
             desired.leftRear = 0;
@@ -611,11 +693,23 @@ void FastTask(void *pvParameters) {
         gillTelemetry.actualRightRear = currentOutputs.rightRear / 1000.0f;
         gillTelemetry.easingRate = currentCommand.easingRate;
         gillTelemetry.brakeActive = brake;
-        gillTelemetry.honkActive = honk;
 
+<<<<<<< HEAD
         if (honk && BUZZER_PIN >= 0) {
             beep(400, 10);
+=======
+        static bool lastHonkFlag = false;
+        static bool honkToggleState = false;
+        if (lastHonkFlag && !honkFlag) {
+            honkToggleState = !honkToggleState;
+            if (BUZZER_PIN >= 0) {
+                const uint16_t honkChord[] = {523, 659, 784};
+                enqueueChord(honkChord, sizeof(honkChord) / sizeof(honkChord[0]), honkToggleState ? 350 : 200);
+            }
+>>>>>>> bb1c51d3ad3b95c99d57d4724e247c84f1fa19dd
         }
+        lastHonkFlag = honkFlag;
+        gillTelemetry.honkActive = honkToggleState;
 
         vTaskDelayUntil(&lastWake, interval);
     }
