@@ -22,6 +22,5 @@ bool init(const DriverPins &lf, const DriverPins &lr,
 void calibrate();
 void update(bool enabled, Outputs &current, const Outputs &target);
 void stop();
-void setEasingRate(float rate);
 }
 
