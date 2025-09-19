@@ -19,6 +19,7 @@ enum PairingType : uint8_t {
     SCAN_REQUEST = 0x01,
     DRONE_IDENTITY = 0x02,
     ILITE_IDENTITY = 0x03,
+    ELITE_IDENTITY = 0x05,
     DRONE_ACK = 0x04,
 };
 
