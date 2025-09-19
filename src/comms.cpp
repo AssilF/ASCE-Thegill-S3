@@ -1,11 +1,65 @@
 #include "comms.h"
 #include <cstring>
+#include <ctype.h>
 
 namespace Comms {
 static bool g_paired = false;
 static ThegillCommand lastCmd = {};
 static uint8_t controllerMac[6] = {0};
 const uint8_t BroadcastMac[6] = {0xff,0xff,0xff,0xff,0xff,0xff};
+
+static bool identityContains(const IdentityMessage &msg, const char *needle)
+{
+    const size_t maxLen = sizeof(msg.identity);
+    const size_t needleLen = strlen(needle);
+    if (needleLen == 0 || needleLen > maxLen)
+        return false;
+
+    for (size_t start = 0; start + needleLen <= maxLen; ++start)
+    {
+        if (msg.identity[start] == '\0')
+            break;
+
+        bool match = true;
+        for (size_t i = 0; i < needleLen; ++i)
+        {
+            size_t idx = start + i;
+            if (idx >= maxLen)
+            {
+                match = false;
+                break;
+            }
+            char actual = msg.identity[idx];
+            if (actual == '\0')
+            {
+                match = false;
+                break;
+            }
+            char expected = needle[i];
+            actual = toupper(static_cast<unsigned char>(actual));
+            expected = toupper(static_cast<unsigned char>(expected));
+            if (actual != expected)
+            {
+                match = false;
+                break;
+            }
+        }
+        if (match)
+            return true;
+    }
+    return false;
+}
+
+static bool isEliteControllerIdentity(const IdentityMessage &msg)
+{
+    if (msg.type == ILITE_IDENTITY || msg.type == ELITE_IDENTITY)
+        return true;
+    if (identityContains(msg, "ELITE"))
+        return true;
+    if (identityContains(msg, "ILITE"))
+        return true;
+    return false;
+}
 
 static void onDataRecv(const uint8_t* mac, const uint8_t* incomingData, int len) {
     if (len == sizeof(IdentityMessage) && !g_paired) {
@@ -17,7 +71,7 @@ static void onDataRecv(const uint8_t* mac, const uint8_t* incomingData, int len)
             WiFi.macAddress(resp.mac);
             esp_now_send(mac, reinterpret_cast<const uint8_t*>(&resp), sizeof(resp));
             return;
-        } else if (msg->type == ILITE_IDENTITY) {
+        } else if (isEliteControllerIdentity(*msg)) {
             memcpy(controllerMac, mac, 6);
             if (!esp_now_is_peer_exist(mac)) {
                 esp_now_peer_info_t peerInfo{};
