@@ -358,14 +358,9 @@ static void runMotorStartupTest()
 {
     Serial.println("Running motor startup self-test...");
 
-<<<<<<< HEAD
-    Motor::Outputs testOutputs{-300, 300, 300, 300};
-    Motor::Outputs stopOutputs{0, 0, 0, 0};
-=======
     const int16_t maxTestOutput = 300;
     const int16_t step = 50;
     const uint16_t stepDelayMs = 50;
->>>>>>> bb1c51d3ad3b95c99d57d4724e247c84f1fa19dd
 
     Motor::Outputs outputs{0, 0, 0, 0};
 
@@ -694,10 +689,6 @@ void FastTask(void *pvParameters) {
         gillTelemetry.easingRate = currentCommand.easingRate;
         gillTelemetry.brakeActive = brake;
 
-<<<<<<< HEAD
-        if (honk && BUZZER_PIN >= 0) {
-            beep(400, 10);
-=======
         static bool lastHonkFlag = false;
         static bool honkToggleState = false;
         if (lastHonkFlag && !honkFlag) {
@@ -706,7 +697,6 @@ void FastTask(void *pvParameters) {
                 const uint16_t honkChord[] = {523, 659, 784};
                 enqueueChord(honkChord, sizeof(honkChord) / sizeof(honkChord[0]), honkToggleState ? 350 : 200);
             }
->>>>>>> bb1c51d3ad3b95c99d57d4724e247c84f1fa19dd
         }
         lastHonkFlag = honkFlag;
         gillTelemetry.honkActive = honkToggleState;
