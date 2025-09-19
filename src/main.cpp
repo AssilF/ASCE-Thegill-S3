@@ -256,7 +256,7 @@ static void runMotorStartupTest()
 {
     Serial.println("Running motor startup self-test...");
 
-    Motor::Outputs testOutputs{300, 300, 300, 300};
+    Motor::Outputs testOutputs{-300, 300, 300, 300};
     Motor::Outputs stopOutputs{0, 0, 0, 0};
 
     targetOutputs = testOutputs;
