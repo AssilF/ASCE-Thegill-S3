@@ -1,6 +1,7 @@
 #include "motor.h"
 #include <math.h>
 #include <Arduino.h>
+#include "device_config.h"
 
 namespace Motor {
 namespace {
@@ -39,6 +40,18 @@ static hw_timer_t *pwmTimer = nullptr;
 static portMUX_TYPE timerMux = portMUX_INITIALIZER_UNLOCKED;
 static volatile uint64_t currentTicks = 0;
 static volatile uint32_t alarmInterval = DEFAULT_IDLE_INTERVAL;
+
+constexpr float COMMAND_SCALE = 1000.0f;
+constexpr float COMMAND_DEADBAND = config::kMotorCommandDeadband;
+constexpr float COMMAND_DEADBAND_COUNTS = COMMAND_DEADBAND * COMMAND_SCALE;
+
+inline int16_t applyCommandDeadband(int16_t value)
+{
+    if (fabsf(static_cast<float>(value)) <= COMMAND_DEADBAND_COUNTS) {
+        return 0;
+    }
+    return value;
+}
 
 inline void setPinLevel(int pin, int level)
 {
@@ -179,7 +192,8 @@ void applyOutput(size_t index, int16_t command)
     DriverState &state = drivers[index];
     if (!state.initialised) return;
 
-    float magnitude = fabsf(static_cast<float>(command) / 1000.0f);
+    int16_t filteredCommand = applyCommandDeadband(command);
+    float magnitude = fabsf(static_cast<float>(filteredCommand) / COMMAND_SCALE);
     magnitude = constrain(magnitude, 0.0f, 1.0f);
     uint32_t freq = computeFrequency();
     uint32_t periodTicks = computePeriodTicks(freq);
@@ -188,9 +202,9 @@ void applyOutput(size_t index, int16_t command)
     if (magnitude > 0.0f && onTicks == 0) onTicks = 1;
 
     uint8_t activePin = ACTIVE_NONE;
-    if (command > 0) {
+    if (filteredCommand > 0) {
         activePin = ACTIVE_FORWARD;
-    } else if (command < 0) {
+    } else if (filteredCommand < 0) {
         activePin = ACTIVE_REVERSE;
     }
 
@@ -280,6 +294,11 @@ void update(bool enabled, Outputs &current, const Outputs &target)
     } else {
         next.leftFront = next.leftRear = next.rightFront = next.rightRear = 0;
     }
+
+    next.leftFront = applyCommandDeadband(next.leftFront);
+    next.leftRear = applyCommandDeadband(next.leftRear);
+    next.rightFront = applyCommandDeadband(next.rightFront);
+    next.rightRear = applyCommandDeadband(next.rightRear);
 
     applyOutput(0, next.leftFront);
     applyOutput(1, next.leftRear);
