@@ -624,23 +624,23 @@ void checkFailsafe() {
     ThegillCommand safe = loadCommandSnapshot();
     bool changed = false;
 
-    auto rampValue = [&](int16_t &value) {
-        int16_t original = value;
-        if (value > 0) {
-            int16_t next = value - 20;
-            value = next < 0 ? 0 : next;
-        } else if (value < 0) {
-            int16_t next = value + 20;
-            value = next > 0 ? 0 : next;
+    auto rampValue = [&](int16_t *value) {
+        int16_t original = *value;
+        if (*value > 0) {
+            int16_t next = *value - 20;
+            *value = next < 0 ? 0 : next;
+        } else if (*value < 0) {
+            int16_t next = *value + 20;
+            *value = next > 0 ? 0 : next;
         }
-        if (value != original)
+        if (*value != original)
             changed = true;
     };
 
-    rampValue(safe.leftFront);
-    rampValue(safe.leftRear);
-    rampValue(safe.rightFront);
-    rampValue(safe.rightRear);
+    rampValue(&safe.leftFront);
+    rampValue(&safe.leftRear);
+    rampValue(&safe.rightFront);
+    rampValue(&safe.rightRear);
 
     if (changed) {
         storeCommandSnapshot(safe);

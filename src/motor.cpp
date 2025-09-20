@@ -18,8 +18,8 @@ struct PwmState {
     volatile uint8_t activePin;
 };
 
-constexpr uint32_t PWM_MAX_FREQ = 600;
-constexpr uint32_t PWM_MIN_FREQ = 250;
+constexpr uint32_t PWM_MAX_FREQ = 24000;
+constexpr uint32_t PWM_MIN_FREQ = 16000;
 constexpr uint32_t TIMER_BASE_FREQ = 1000000; // 1 MHz base for scheduling
 constexpr uint32_t PWM_TARGET_FREQ = 400; // Hz, within 250-600 Hz band
 constexpr uint32_t DEFAULT_IDLE_INTERVAL = TIMER_BASE_FREQ / PWM_TARGET_FREQ;
