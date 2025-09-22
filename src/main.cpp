@@ -382,7 +382,7 @@ static void runMotorStartupTest()
     {
         outputs.leftFront = outputs.leftRear = outputs.rightFront = outputs.rightRear = value;
         targetOutputs = outputs;
-        Motor::update(true, currentOutputs, targetOutputs);
+        Motor::update(true, false, currentOutputs, targetOutputs);
         delay(stepDelayMs);
     }
 
@@ -392,12 +392,12 @@ static void runMotorStartupTest()
     {
         outputs.leftFront = outputs.leftRear = outputs.rightFront = outputs.rightRear = value;
         targetOutputs = outputs;
-        Motor::update(true, currentOutputs, targetOutputs);
+        Motor::update(true, false, currentOutputs, targetOutputs);
         delay(stepDelayMs);
     }
 
     targetOutputs = {0, 0, 0, 0};
-    Motor::update(false, currentOutputs, targetOutputs);
+    Motor::update(false, false, currentOutputs, targetOutputs);
     Serial.println("Motor startup self-test complete.");
 }
 
@@ -684,7 +684,7 @@ void FastTask(void *pvParameters) {
         }
 
         targetOutputs = desired;
-        Motor::update(isArmed && !brake, currentOutputs, targetOutputs);
+        Motor::update(isArmed, brake, currentOutputs, targetOutputs);
 
         gillTelemetry.targetLeftFront = desired.leftFront / 1000.0f;
         gillTelemetry.targetLeftRear = desired.leftRear / 1000.0f;
@@ -813,7 +813,7 @@ void setup()
     initialCommand.flags |= GILL_FLAG_BRAKE;
     storeCommandSnapshot(initialCommand);
     targetOutputs = {0, 0, 0, 0};
-    Motor::update(false, currentOutputs, targetOutputs);
+    Motor::update(false, false, currentOutputs, targetOutputs);
 
     runMotorStartupTest();
     setLastCommandTimeMs(millis());
