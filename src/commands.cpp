@@ -61,11 +61,11 @@ void handleCommand(const String &cmd) {
         sendLine("PONG");
     } else if (trimmed == "arm") {
         isArmed = true;
-        Motor::update(isArmed, currentOutputs, targetOutputs);
+        Motor::update(isArmed, false, currentOutputs, targetOutputs);
         sendLine("ACK: Motors armed");
     } else if (trimmed == "disarm") {
         isArmed = false;
-        Motor::update(isArmed, currentOutputs, targetOutputs);
+        Motor::update(isArmed, false, currentOutputs, targetOutputs);
         sendLine("ACK: Motors disarmed");
     } else {
         sendLine("ERROR: Unknown command");

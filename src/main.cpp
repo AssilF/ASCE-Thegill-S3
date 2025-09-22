@@ -16,7 +16,7 @@
 
 // ==================== BOARD CONFIGURATION ====================
 // ESP32-S3 pin mappings for BTS7960 bridge drivers and task sizes
-const Motor::DriverPins PINS_LEFT_FRONT  = {4, 5, -1};
+const Motor::DriverPins PINS_LEFT_FRONT  = {21, 47, -1};
 const Motor::DriverPins PINS_LEFT_REAR   = {6, 7, -1};
 const Motor::DriverPins PINS_RIGHT_FRONT = {9, 8, -1};
 const Motor::DriverPins PINS_RIGHT_REAR  = {15, 16, -1};
@@ -382,22 +382,32 @@ static void runMotorStartupTest()
     {
         outputs.leftFront = outputs.leftRear = outputs.rightFront = outputs.rightRear = value;
         targetOutputs = outputs;
-        Motor::update(true, currentOutputs, targetOutputs);
+        Motor::update(true, false, currentOutputs, targetOutputs);
         delay(stepDelayMs);
     }
 
     delay(200);
 
-    for (int16_t value = maxTestOutput; value >= 0; value -= step)
+    for (int16_t value = maxTestOutput; value >= -maxTestOutput; value -= step)
     {
         outputs.leftFront = outputs.leftRear = outputs.rightFront = outputs.rightRear = value;
         targetOutputs = outputs;
-        Motor::update(true, currentOutputs, targetOutputs);
+        Motor::update(true, false, currentOutputs, targetOutputs);
+        delay(stepDelayMs);
+    }
+
+    delay(200);
+
+    for (int16_t value = -maxTestOutput; value >= 0; value += step)
+    {
+        outputs.leftFront = outputs.leftRear = outputs.rightFront = outputs.rightRear = value;
+        targetOutputs = outputs;
+        Motor::update(true, false, currentOutputs, targetOutputs);
         delay(stepDelayMs);
     }
 
     targetOutputs = {0, 0, 0, 0};
-    Motor::update(false, currentOutputs, targetOutputs);
+    Motor::update(false, false, currentOutputs, targetOutputs);
     Serial.println("Motor startup self-test complete.");
 }
 
@@ -684,7 +694,7 @@ void FastTask(void *pvParameters) {
         }
 
         targetOutputs = desired;
-        Motor::update(isArmed && !brake, currentOutputs, targetOutputs);
+        Motor::update(isArmed, brake, currentOutputs, targetOutputs);
 
         gillTelemetry.targetLeftFront = desired.leftFront / 1000.0f;
         gillTelemetry.targetLeftRear = desired.leftRear / 1000.0f;
@@ -813,7 +823,7 @@ void setup()
     initialCommand.flags |= GILL_FLAG_BRAKE;
     storeCommandSnapshot(initialCommand);
     targetOutputs = {0, 0, 0, 0};
-    Motor::update(false, currentOutputs, targetOutputs);
+    Motor::update(false, false, currentOutputs, targetOutputs);
 
     runMotorStartupTest();
     setLastCommandTimeMs(millis());
