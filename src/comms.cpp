@@ -98,7 +98,7 @@ static bool initInternal(const char *ssid, const char *password, int tcpPort, es
     (void)tcpPort;
     // Run in AP+STA mode so ESP-NOW remains operational alongside SoftAP
     WiFi.mode(WIFI_AP_STA);
-    WiFi.setTxPower(WIFI_POWER_18_5dBm);
+    WiFi.setTxPower(WIFI_POWER_19_5dBm);
     WiFi.setSleep(false);
     WiFi.softAP(ssid, password);
 
