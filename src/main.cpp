@@ -18,7 +18,7 @@
 // ESP32-S3 pin mappings for BTS7960 bridge drivers and task sizes
 const Motor::DriverPins PINS_LEFT_FRONT  = {21, 47, -1};
 const Motor::DriverPins PINS_LEFT_REAR   = {6, 7, -1};
-const Motor::DriverPins PINS_RIGHT_FRONT = {9, 8, -1};
+const Motor::DriverPins PINS_RIGHT_FRONT = {8, 9, -1};
 const Motor::DriverPins PINS_RIGHT_REAR  = {15, 16, -1};
 const int BUZZER_PIN = 12; // optional piezo buzzer
 const uint32_t CPU_FREQ_MHZ = 240;
