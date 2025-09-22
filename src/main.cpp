@@ -16,11 +16,11 @@
 
 // ==================== BOARD CONFIGURATION ====================
 // ESP32-S3 pin mappings for BTS7960 bridge drivers and task sizes
-const Motor::DriverPins PINS_LEFT_FRONT  = {21, 47, -1};
-const Motor::DriverPins PINS_LEFT_REAR   = {6, 7, -1};
-const Motor::DriverPins PINS_RIGHT_FRONT = {8, 9, -1};
-const Motor::DriverPins PINS_RIGHT_REAR  = {15, 16, -1};
-const int BUZZER_PIN = 12; // optional piezo buzzer
+const Motor::DriverPins PINS_LEFT_FRONT  = {6,   5, -1};
+const Motor::DriverPins PINS_LEFT_REAR   = { 10, 9, -1};
+const Motor::DriverPins PINS_RIGHT_FRONT = { 7,  15, -1};
+const Motor::DriverPins PINS_RIGHT_REAR  = {   47, 21,  -1};
+const int BUZZER_PIN = 13; // optional piezo buzzer
 const uint32_t CPU_FREQ_MHZ = 240;
 const uint16_t FAST_TASK_STACK = 4096;
 const uint16_t COMM_TASK_STACK = 8192;
@@ -124,6 +124,20 @@ static inline void storeCommandSnapshotFromISR(const ThegillCommand &value)
     portENTER_CRITICAL_ISR(&commandMux);
     command = value;
     portEXIT_CRITICAL_ISR(&commandMux);
+}
+
+static inline Motor::Outputs commandToMotorOutputs(const ThegillCommand &cmd)
+{
+    // The ELITE/ILITE control payload orders motors as front-left, front-right,
+    // rear-left, rear-right.  Our Motor::Outputs structure expects them in
+    // left-front, left-rear, right-front, right-rear order.  Re-map the values
+    // here so every caller can work with physical motor positions.
+    Motor::Outputs outputs{};
+    outputs.leftFront = static_cast<int16_t>(constrain(cmd.leftFront, MOTOR_MIN, MOTOR_MAX));
+    outputs.leftRear = static_cast<int16_t>(constrain(cmd.rightFront, MOTOR_MIN, MOTOR_MAX));
+    outputs.rightFront = static_cast<int16_t>(constrain(cmd.leftRear, MOTOR_MIN, MOTOR_MAX));
+    outputs.rightRear = static_cast<int16_t>(constrain(cmd.rightRear, MOTOR_MIN, MOTOR_MAX));
+    return outputs;
 }
 
 static inline LinkStateSnapshot loadLinkStateSnapshot()
@@ -368,32 +382,22 @@ static void runMotorStartupTest()
     {
         outputs.leftFront = outputs.leftRear = outputs.rightFront = outputs.rightRear = value;
         targetOutputs = outputs;
-        Motor::update(true, false, currentOutputs, targetOutputs);
+        Motor::update(true, currentOutputs, targetOutputs);
         delay(stepDelayMs);
     }
 
     delay(200);
 
-    for (int16_t value = maxTestOutput; value >= -maxTestOutput; value -= step)
+    for (int16_t value = maxTestOutput; value >= 0; value -= step)
     {
         outputs.leftFront = outputs.leftRear = outputs.rightFront = outputs.rightRear = value;
         targetOutputs = outputs;
-        Motor::update(true, false, currentOutputs, targetOutputs);
-        delay(stepDelayMs);
-    }
-
-    delay(200);
-
-    for (int16_t value = -maxTestOutput; value >= 0; value += step)
-    {
-        outputs.leftFront = outputs.leftRear = outputs.rightFront = outputs.rightRear = value;
-        targetOutputs = outputs;
-        Motor::update(true, false, currentOutputs, targetOutputs);
+        Motor::update(true, currentOutputs, targetOutputs);
         delay(stepDelayMs);
     }
 
     targetOutputs = {0, 0, 0, 0};
-    Motor::update(false, false, currentOutputs, targetOutputs);
+    Motor::update(false, currentOutputs, targetOutputs);
     Serial.println("Motor startup self-test complete.");
 }
 
@@ -654,8 +658,7 @@ void checkFailsafe() {
 
     if (changed) {
         storeCommandSnapshot(safe);
-        Motor::Outputs newOutputs{safe.leftFront, safe.leftRear, safe.rightFront, safe.rightRear};
-        targetOutputs = newOutputs;
+        targetOutputs = commandToMotorOutputs(safe);
     } else {
         rampingDown = false;
     }
@@ -669,12 +672,7 @@ void FastTask(void *pvParameters) {
     while (true) {
         ThegillCommand currentCommand = loadCommandSnapshot();
 
-        Motor::Outputs desired{
-            static_cast<int16_t>(constrain(currentCommand.leftFront, MOTOR_MIN, MOTOR_MAX)),
-            static_cast<int16_t>(constrain(currentCommand.leftRear, MOTOR_MIN, MOTOR_MAX)),
-            static_cast<int16_t>(constrain(currentCommand.rightFront, MOTOR_MIN, MOTOR_MAX)),
-            static_cast<int16_t>(constrain(currentCommand.rightRear, MOTOR_MIN, MOTOR_MAX))
-        };
+        Motor::Outputs desired = commandToMotorOutputs(currentCommand);
 
         bool brake = (currentCommand.flags & GILL_FLAG_BRAKE) != 0;
         bool honkFlag = (currentCommand.flags & GILL_FLAG_HONK) != 0;
@@ -686,7 +684,7 @@ void FastTask(void *pvParameters) {
         }
 
         targetOutputs = desired;
-        Motor::update(isArmed, brake, currentOutputs, targetOutputs);
+        Motor::update(isArmed && !brake, currentOutputs, targetOutputs);
 
         gillTelemetry.targetLeftFront = desired.leftFront / 1000.0f;
         gillTelemetry.targetLeftRear = desired.leftRear / 1000.0f;
@@ -815,7 +813,7 @@ void setup()
     initialCommand.flags |= GILL_FLAG_BRAKE;
     storeCommandSnapshot(initialCommand);
     targetOutputs = {0, 0, 0, 0};
-    Motor::update(false, false, currentOutputs, targetOutputs);
+    Motor::update(false, currentOutputs, targetOutputs);
 
     runMotorStartupTest();
     setLastCommandTimeMs(millis());

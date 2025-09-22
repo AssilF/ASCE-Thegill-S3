@@ -20,7 +20,7 @@ struct DriverPins {
 bool init(const DriverPins &lf, const DriverPins &lr,
           const DriverPins &rf, const DriverPins &rr);
 void calibrate();
-void update(bool enabled, bool brake, Outputs &current, const Outputs &target);
+void update(bool enabled, Outputs &current, const Outputs &target);
 void stop();
 }
 
