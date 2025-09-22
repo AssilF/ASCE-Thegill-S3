@@ -126,6 +126,20 @@ static inline void storeCommandSnapshotFromISR(const ThegillCommand &value)
     portEXIT_CRITICAL_ISR(&commandMux);
 }
 
+static inline Motor::Outputs commandToMotorOutputs(const ThegillCommand &cmd)
+{
+    // The ELITE/ILITE control payload orders motors as front-left, front-right,
+    // rear-left, rear-right.  Our Motor::Outputs structure expects them in
+    // left-front, left-rear, right-front, right-rear order.  Re-map the values
+    // here so every caller can work with physical motor positions.
+    Motor::Outputs outputs{};
+    outputs.leftFront = static_cast<int16_t>(constrain(cmd.leftFront, MOTOR_MIN, MOTOR_MAX));
+    outputs.leftRear = static_cast<int16_t>(constrain(cmd.rightFront, MOTOR_MIN, MOTOR_MAX));
+    outputs.rightFront = static_cast<int16_t>(constrain(cmd.leftRear, MOTOR_MIN, MOTOR_MAX));
+    outputs.rightRear = static_cast<int16_t>(constrain(cmd.rightRear, MOTOR_MIN, MOTOR_MAX));
+    return outputs;
+}
+
 static inline LinkStateSnapshot loadLinkStateSnapshot()
 {
     LinkStateSnapshot snapshot;
@@ -644,8 +658,7 @@ void checkFailsafe() {
 
     if (changed) {
         storeCommandSnapshot(safe);
-        Motor::Outputs newOutputs{safe.leftFront, safe.leftRear, safe.rightFront, safe.rightRear};
-        targetOutputs = newOutputs;
+        targetOutputs = commandToMotorOutputs(safe);
     } else {
         rampingDown = false;
     }
@@ -659,12 +672,7 @@ void FastTask(void *pvParameters) {
     while (true) {
         ThegillCommand currentCommand = loadCommandSnapshot();
 
-        Motor::Outputs desired{
-            static_cast<int16_t>(constrain(currentCommand.leftFront, MOTOR_MIN, MOTOR_MAX)),
-            static_cast<int16_t>(constrain(currentCommand.leftRear, MOTOR_MIN, MOTOR_MAX)),
-            static_cast<int16_t>(constrain(currentCommand.rightFront, MOTOR_MIN, MOTOR_MAX)),
-            static_cast<int16_t>(constrain(currentCommand.rightRear, MOTOR_MIN, MOTOR_MAX))
-        };
+        Motor::Outputs desired = commandToMotorOutputs(currentCommand);
 
         bool brake = (currentCommand.flags & GILL_FLAG_BRAKE) != 0;
         bool honkFlag = (currentCommand.flags & GILL_FLAG_HONK) != 0;
