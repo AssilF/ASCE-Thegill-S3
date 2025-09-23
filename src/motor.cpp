@@ -23,7 +23,7 @@ struct PwmState {
 };
 
 constexpr size_t kMotorCount = config::kMotorCount;
-constexpr uint32_t kTimerBaseFrequencyHz = 1'000'000;  // 1 MHz timer base
+constexpr uint32_t kTimerBaseFrequencyHz = 1000000;  // 1 MHz timer base
 constexpr uint32_t kPwmFrequencyMin = config::kMotorPwmFrequencyLow;
 constexpr uint32_t kDefaultIdleInterval =
     kTimerBaseFrequencyHz / (kPwmFrequencyMin > 0 ? kPwmFrequencyMin : 1);

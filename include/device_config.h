@@ -25,10 +25,10 @@ constexpr float kMotorCommandDeadband = 0.01f;
 constexpr float kMotorFrequencyThresholdLow = 0.05f;
 constexpr float kMotorFrequencyThresholdMidLow = 0.2f;
 constexpr float kMotorFrequencyThresholdMidHigh = 0.5f;
-constexpr uint32_t kMotorPwmFrequencyLow = 400;
-constexpr uint32_t kMotorPwmFrequencyMidLow = 800;
-constexpr uint32_t kMotorPwmFrequencyMidHigh = 2000;
-constexpr uint32_t kMotorPwmFrequencyHigh = 4000;
+constexpr uint32_t kMotorPwmFrequencyLow = 6000;
+constexpr uint32_t kMotorPwmFrequencyMidLow = 10000;
+constexpr uint32_t kMotorPwmFrequencyMidHigh = 16000;
+constexpr uint32_t kMotorPwmFrequencyHigh = 22000;
 
 constexpr MotorPinConfig kMotorPins[kMotorCount] = {
     // Left side motors share orientation, right side are mirrored and inverted.
