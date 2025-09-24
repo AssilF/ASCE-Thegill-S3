@@ -246,6 +246,8 @@ void applyOutput(size_t index, int16_t command, bool outputsEnabled, bool brake)
         return;
     }
 
+    bool driverActive = false;
+
     portENTER_CRITICAL(&timerMux);
     PwmState &pwm = pwmStates[index];
     pwm.periodTicks = periodTicks;
@@ -258,6 +260,7 @@ void applyOutput(size_t index, int16_t command, bool outputsEnabled, bool brake)
         pwm.nextEvent = currentTicks + periodTicks;
         setPinLevel(state.pins.forwardPin, HIGH);
         setPinLevel(state.pins.reversePin, HIGH);
+        driverActive = true;
     } else if (filteredCommand == 0) {
         pwm.onTicks = 0;
         pwm.activePin = kActiveNone;
@@ -270,16 +273,23 @@ void applyOutput(size_t index, int16_t command, bool outputsEnabled, bool brake)
         if (onTicks > periodTicks) {
             onTicks = periodTicks;
         }
-        if (magnitude > 0.0f && onTicks == 0) {
-            onTicks = 1;
-        }
 
-        pwm.onTicks = onTicks;
-        pwm.activePin = (filteredCommand > 0) ? kActiveForward : kActiveReverse;
-        setPinLevel(state.pins.forwardPin, LOW);
-        setPinLevel(state.pins.reversePin, LOW);
-        pwm.nextEvent = currentTicks;
-        setAlarmIntervalLocked(1);
+        if (onTicks == 0) {
+            pwm.onTicks = 0;
+            pwm.activePin = kActiveNone;
+            pwm.nextEvent = currentTicks + periodTicks;
+            setPinLevel(state.pins.forwardPin, LOW);
+            setPinLevel(state.pins.reversePin, LOW);
+        } else {
+            pwm.onTicks = onTicks;
+            pwm.activePin =
+                (filteredCommand > 0) ? kActiveForward : kActiveReverse;
+            setPinLevel(state.pins.forwardPin, LOW);
+            setPinLevel(state.pins.reversePin, LOW);
+            pwm.nextEvent = currentTicks;
+            setAlarmIntervalLocked(1);
+            driverActive = true;
+        }
     }
     portEXIT_CRITICAL(&timerMux);
 
@@ -287,8 +297,7 @@ void applyOutput(size_t index, int16_t command, bool outputsEnabled, bool brake)
         if (brake) {
             digitalWrite(state.pins.enablePin, HIGH);
         } else {
-            digitalWrite(state.pins.enablePin,
-                         filteredCommand != 0 ? HIGH : LOW);
+            digitalWrite(state.pins.enablePin, driverActive ? HIGH : LOW);
         }
     }
 }
