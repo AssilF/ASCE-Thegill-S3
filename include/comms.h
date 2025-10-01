@@ -2,6 +2,7 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <esp_now.h>
+#include "thegill.h"
 
 namespace Comms {
 
@@ -84,7 +85,9 @@ bool init(const char *ssid, const char *password, int tcpPort, esp_now_recv_cb_t
 void loop();
 
 bool receiveCommand(ControlPacket &cmd, uint32_t *timestampMs = nullptr);
+bool receiveThegillCommand(ThegillCommand &cmd, uint32_t *timestampMs = nullptr);
 uint32_t lastCommandTimestamp();
+uint32_t lastThegillCommandTimestamp();
 LinkStatus getLinkStatus();
 bool paired();
 

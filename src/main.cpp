@@ -8,11 +8,12 @@
 #include <freertos/task.h>
 #include <freertos/portmacro.h>
 #include <cstring>
-#include <ctype.h>
+#include <cstdlib>
 #include "comms.h"
 #include "commands.h"
 #include "thegill.h"
 #include "motor.h"
+#include "device_config.h"
 
 // ==================== BOARD CONFIGURATION ====================
 // ESP32-S3 pin mappings for BTS7960 bridge drivers and task sizes
@@ -28,6 +29,7 @@ const uint16_t FAILSAFE_TASK_STACK = 2048;
 const uint16_t TELEMETRY_TASK_STACK = 4096;
 const uint16_t OTA_TASK_STACK = 2048;
 const uint16_t BUZZER_TASK_STACK = 1024;
+const uint16_t STATUS_LED_TASK_STACK = 1024;
 #define CREATE_TASK(fn, name, stack, prio, handle, core) xTaskCreatePinnedToCore(fn, name, stack, NULL, prio, handle, core)
 
 
@@ -35,6 +37,7 @@ const uint16_t BUZZER_TASK_STACK = 1024;
 // independently of the MCPWM timers driving the motors.
 
 const int BUZZER_CHANNEL = 5;
+const int STATUS_LED_PIN = config::kStatusLedPin;
 
 
 /// ==================== CONSTANTS ====================
@@ -47,7 +50,7 @@ const int16_t MOTOR_MIN = -1000;
 const int16_t MOTOR_MAX = 1000;
 const unsigned long FAILSAFE_TIMEOUT = 500;  // ms
 const unsigned long TELEMETRY_INTERVAL = 50; // ms
-bool failsafe_enable = true;
+bool failsafe_enable = false;
 bool isArmed = true;
 
 const char *DRONE_ID = "Thegill";
@@ -65,7 +68,6 @@ WiFiServer server(TCP_PORT);
 WiFiClient client;
 ThegillCommand command = {THEGILL_PACKET_MAGIC, 0, 0, 0, 0, 4.0f, GillMode::Default, GillEasing::EaseInOut, 0, 0};
 portMUX_TYPE commandMux = portMUX_INITIALIZER_UNLOCKED;
-portMUX_TYPE commsStateMux = portMUX_INITIALIZER_UNLOCKED;
 Motor::Outputs currentOutputs{0, 0, 0, 0};
 Motor::Outputs targetOutputs{0, 0, 0, 0};
 ThegillTelemetry gillTelemetry{};
@@ -73,36 +75,13 @@ unsigned long lastTelemetry = 0;
 QueueHandle_t buzzerQueue = nullptr;
 
 // ==================== COMMUNICATION FUNCTIONS ====================
-// Time in ms before we consider the controller disconnected
-const unsigned long CONNECTION_TIMEOUT = 1000;
-// Minimum delay between handshake responses to avoid spamming
-const unsigned long HANDSHAKE_COOLDOWN = 500;
-unsigned long lastHandshakeSent = 0;
 bool telemetryEnabled = false; // Serial/TCP telemetry disabled by default
 const int MAX_MESSAGE_LENGTH = 256;
 char messageBuffer[MAX_MESSAGE_LENGTH + 1] = {0};
 size_t messageLength = 0;
 bool serialActive = false; // Tracks if a Serial session is currently open
 
-// Dynamic ESP-NOW pairing
-static uint8_t iliteMac[6] = {0};
-uint8_t selfMac[6];
-static uint8_t commandPeer[6] = {0};
-static bool ilitePaired = false;
-static bool commandPeerSet = false;
-static uint32_t lastCommandTimeMs = 0;
-unsigned long lastDiscoveryTime = 0;
-
-
 // ==================== IMPROVED COMMUNICATION FUNCTIONS ====================
-
-struct LinkStateSnapshot {
-    bool ilitePaired = false;
-    bool commandPeerSet = false;
-    uint8_t iliteMac[6] = {0};
-    uint8_t commandPeer[6] = {0};
-    uint32_t lastCommandTimeMs = 0;
-};
 
 static inline ThegillCommand loadCommandSnapshot()
 {
@@ -140,82 +119,70 @@ static inline Motor::Outputs commandToMotorOutputs(const ThegillCommand &cmd)
     return outputs;
 }
 
-static inline LinkStateSnapshot loadLinkStateSnapshot()
+static int16_t decodeMotionBits(uint8_t encoded, int16_t magnitude, bool &brakeRequested)
 {
-    LinkStateSnapshot snapshot;
-    portENTER_CRITICAL(&commsStateMux);
-    snapshot.ilitePaired = ilitePaired;
-    snapshot.commandPeerSet = commandPeerSet;
-    memcpy(snapshot.iliteMac, iliteMac, sizeof(iliteMac));
-    memcpy(snapshot.commandPeer, commandPeer, sizeof(commandPeer));
-    snapshot.lastCommandTimeMs = lastCommandTimeMs;
-    portEXIT_CRITICAL(&commsStateMux);
-    return snapshot;
-}
-
-static inline void setLastCommandTimeMs(uint32_t value)
-{
-    portENTER_CRITICAL(&commsStateMux);
-    lastCommandTimeMs = value;
-    portEXIT_CRITICAL(&commsStateMux);
-}
-
-static inline void setLastCommandTimeMsFromISR(uint32_t value)
-{
-    portENTER_CRITICAL_ISR(&commsStateMux);
-    lastCommandTimeMs = value;
-    portEXIT_CRITICAL_ISR(&commsStateMux);
-}
-
-static inline void setIlitePeerFromISR(const uint8_t *mac)
-{
-    portENTER_CRITICAL_ISR(&commsStateMux);
-    memcpy(iliteMac, mac, sizeof(iliteMac));
-    ilitePaired = true;
-    portEXIT_CRITICAL_ISR(&commsStateMux);
-}
-
-static inline bool copyIliteMacFromISR(uint8_t dest[6])
-{
-    portENTER_CRITICAL_ISR(&commsStateMux);
-    bool paired = ilitePaired;
-    if (paired)
+    switch (encoded & 0x03)
     {
-        memcpy(dest, iliteMac, sizeof(iliteMac));
+    case 0x00:
+        return 0;
+    case 0x01:
+        return -magnitude;
+    case 0x02:
+        return magnitude;
+    case 0x03:
+    default:
+        brakeRequested = true;
+        return 0;
     }
-    portEXIT_CRITICAL_ISR(&commsStateMux);
-    return paired;
 }
 
-static inline bool updateCommandPeerFromISR(const uint8_t *mac)
+static void applyControlPacket(const Comms::ControlPacket &packet, uint32_t timestampMs)
 {
-    portENTER_CRITICAL_ISR(&commsStateMux);
-    bool changed = !commandPeerSet || memcmp(commandPeer, mac, sizeof(commandPeer)) != 0;
-    if (changed)
+    (void)timestampMs;
+    ThegillCommand updated = loadCommandSnapshot();
+    updated.magic = THEGILL_PACKET_MAGIC;
+
+    const int16_t magnitude = static_cast<int16_t>(constrain(static_cast<int32_t>(abs(packet.speed)) * 10, 0L, static_cast<long>(MOTOR_MAX)));
+    bool brakeRequested = false;
+
+    auto decode = [&](uint8_t shift) {
+        return decodeMotionBits((packet.motionState >> shift) & 0x03, magnitude, brakeRequested);
+    };
+
+    updated.leftFront = decode(6);
+    updated.leftRear = decode(4);
+    updated.rightFront = decode(2);
+    updated.rightRear = decode(0);
+
+    uint8_t flags = 0;
+    if (brakeRequested || (packet.buttonStates[0] & 0x01))
     {
-        memcpy(commandPeer, mac, sizeof(commandPeer));
-        commandPeerSet = true;
+        flags |= GILL_FLAG_BRAKE;
     }
-    portEXIT_CRITICAL_ISR(&commsStateMux);
-    return changed;
+    if (packet.buttonStates[0] & 0x02)
+    {
+        flags |= GILL_FLAG_HONK;
+    }
+    updated.flags = flags;
+
+    storeCommandSnapshot(updated);
 }
 
-static inline LinkStateSnapshot clearLinkState()
+static void applyThegillCommandPayload(const ThegillCommand &packet, uint32_t timestampMs)
 {
-    LinkStateSnapshot previous;
-    portENTER_CRITICAL(&commsStateMux);
-    previous.ilitePaired = ilitePaired;
-    previous.commandPeerSet = commandPeerSet;
-    memcpy(previous.iliteMac, iliteMac, sizeof(iliteMac));
-    memcpy(previous.commandPeer, commandPeer, sizeof(commandPeer));
-    previous.lastCommandTimeMs = lastCommandTimeMs;
-    ilitePaired = false;
-    commandPeerSet = false;
-    memset(iliteMac, 0, sizeof(iliteMac));
-    memset(commandPeer, 0, sizeof(commandPeer));
-    lastCommandTimeMs = 0;
-    portEXIT_CRITICAL(&commsStateMux);
-    return previous;
+    (void)timestampMs;
+    if (packet.magic != THEGILL_PACKET_MAGIC)
+    {
+        return;
+    }
+
+    ThegillCommand updated = packet;
+    updated.leftFront = static_cast<int16_t>(constrain(updated.leftFront, MOTOR_MIN, MOTOR_MAX));
+    updated.leftRear = static_cast<int16_t>(constrain(updated.leftRear, MOTOR_MIN, MOTOR_MAX));
+    updated.rightFront = static_cast<int16_t>(constrain(updated.rightFront, MOTOR_MIN, MOTOR_MAX));
+    updated.rightRear = static_cast<int16_t>(constrain(updated.rightRear, MOTOR_MIN, MOTOR_MAX));
+
+    storeCommandSnapshot(updated);
 }
 
 static inline void resetMessageBuffer()
@@ -272,59 +239,6 @@ void beep(uint16_t freq, uint16_t duration)
 {
     const uint16_t single[1] = {freq};
     enqueueChord(single, 1, duration);
-}
-
-static bool identityContains(const Comms::IdentityMessage &msg, const char *needle)
-{
-    const size_t maxLen = sizeof(msg.identity);
-    const size_t needleLen = strlen(needle);
-    if (needleLen == 0 || needleLen > maxLen)
-        return false;
-
-    for (size_t start = 0; start + needleLen <= maxLen; ++start)
-    {
-        if (msg.identity[start] == '\0')
-            break;
-
-        bool match = true;
-        for (size_t i = 0; i < needleLen; ++i)
-        {
-            size_t idx = start + i;
-            if (idx >= maxLen)
-            {
-                match = false;
-                break;
-            }
-            char actual = msg.identity[idx];
-            if (actual == '\0')
-            {
-                match = false;
-                break;
-            }
-            char expected = needle[i];
-            actual = toupper(static_cast<unsigned char>(actual));
-            expected = toupper(static_cast<unsigned char>(expected));
-            if (actual != expected)
-            {
-                match = false;
-                break;
-            }
-        }
-        if (match)
-            return true;
-    }
-    return false;
-}
-
-static bool isEliteControllerIdentity(const Comms::IdentityMessage &msg)
-{
-    if (msg.type == Comms::ILITE_IDENTITY || msg.type == Comms::ELITE_IDENTITY)
-        return true;
-    if (identityContains(msg, "ELITE"))
-        return true;
-    if (identityContains(msg, "ILITE"))
-        return true;
-    return false;
 }
 
 void BuzzerTask(void *pvParameters)
@@ -401,6 +315,25 @@ static void runMotorStartupTest()
     Serial.println("Motor startup self-test complete.");
 }
 
+#pragma pack(push, 1)
+struct GillTelemetryPacket {
+    uint32_t magic;
+    float pitch;
+    float roll;
+    float yaw;
+    float pitchCorrection;
+    float rollCorrection;
+    float yawCorrection;
+    uint16_t throttle;
+    int8_t pitchCommand;
+    int8_t rollCommand;
+    int8_t yawCommand;
+    float altitude;
+    float verticalAcc;
+    uint32_t commandAge;
+};
+#pragma pack(pop)
+
 void streamTelemetry()
 {
     if (millis() - lastTelemetry < TELEMETRY_INTERVAL)
@@ -409,33 +342,39 @@ void streamTelemetry()
     lastTelemetry = millis();
 
     ThegillCommand currentCommand = loadCommandSnapshot();
-    LinkStateSnapshot linkState = loadLinkStateSnapshot();
-    uint32_t commandAge = (linkState.lastCommandTimeMs > 0) ? (millis() - linkState.lastCommandTimeMs) : 0;
+    uint32_t nowMs = millis();
+    uint32_t lastCommandMs = Comms::lastCommandTimestamp();
+    uint32_t commandAge = (lastCommandMs != 0 && nowMs >= lastCommandMs) ? (nowMs - lastCommandMs) : 0;
 
-    Comms::TelemetryPacket packet = {
+    int32_t throttleValue = currentOutputs.rightRear + 1000;
+    if (throttleValue < 0)
+    {
+        throttleValue = 0;
+    }
+    else if (throttleValue > 2000)
+    {
+        throttleValue = 2000;
+    }
+
+    GillTelemetryPacket packet{
         PACKET_MAGIC,
         0.0f, 0.0f, 0.0f,
         currentOutputs.leftFront / 1000.0f,
         currentOutputs.leftRear / 1000.0f,
         currentOutputs.rightFront / 1000.0f,
-        static_cast<uint16_t>(currentOutputs.rightRear + 1000),
+        static_cast<uint16_t>(throttleValue),
         static_cast<int8_t>(constrain(targetOutputs.leftFront / 8, -128, 127)),
         static_cast<int8_t>(constrain(targetOutputs.rightFront / 8, -128, 127)),
         static_cast<int8_t>(constrain(targetOutputs.leftRear / 8, -128, 127)),
         0.0f,
+        0.0f,
         commandAge
     };
 
-    // Send telemetry to ELITE/ILITE ground station if paired
-    if (linkState.ilitePaired)
+    Comms::LinkStatus status = Comms::getLinkStatus();
+    if (status.paired && !Comms::macEqual(status.peerMac, Comms::BroadcastMac))
     {
-        esp_now_send(linkState.iliteMac, (uint8_t *)&packet, sizeof(packet));
-    }
-
-    // Also send to the last command peer if different
-    if (linkState.commandPeerSet && (!linkState.ilitePaired || memcmp(linkState.commandPeer, linkState.iliteMac, 6) != 0))
-    {
-        esp_now_send(linkState.commandPeer, (uint8_t *)&packet, sizeof(packet));
+        esp_now_send(status.peerMac, reinterpret_cast<const uint8_t *>(&packet), sizeof(packet));
     }
 
     bool tcpActive = client && client.connected();
@@ -457,7 +396,6 @@ void streamTelemetry()
         client.flush();
     }
 }
-
 void handleIncomingData()
 {
     // Update serial connection status based on host presence
@@ -497,117 +435,7 @@ void handleIncomingData()
     }
 }
 
-// Detect dropped connections and cleanup peers
-void monitorConnection() {
-    LinkStateSnapshot state = loadLinkStateSnapshot();
-    if (!state.ilitePaired)
-        return;
-
-    uint32_t now = millis();
-    if (state.lastCommandTimeMs > 0 && now - state.lastCommandTimeMs > CONNECTION_TIMEOUT)
-    {
-        LinkStateSnapshot cleared = clearLinkState();
-        if (cleared.ilitePaired)
-        {
-            esp_now_del_peer(cleared.iliteMac);
-        }
-    }
-}
-
-// ==================== ESP-NOW CALLBACK ====================
-void onReceive(const uint8_t *mac, const uint8_t *incomingData, int len)
-{
-    if (len == sizeof(Comms::IdentityMessage))
-    {
-        Comms::IdentityMessage msg;
-        memcpy(&msg, incomingData, sizeof(msg));
-        unsigned long now = millis();
-        if (msg.type == Comms::SCAN_REQUEST)
-        {
-            if (now - lastHandshakeSent > HANDSHAKE_COOLDOWN)
-            {
-                if (!esp_now_is_peer_exist(mac))
-                {
-                    esp_now_peer_info_t peerInfo = {};
-                    memcpy(peerInfo.peer_addr, mac, 6);
-                    peerInfo.channel = 0;
-                    peerInfo.encrypt = false;
-                    esp_now_add_peer(&peerInfo);
-                }
-                Comms::IdentityMessage resp = {};
-                resp.type = Comms::DRONE_IDENTITY;
-                strncpy(resp.identity, DRONE_ID, sizeof(resp.identity));
-                memcpy(resp.mac, selfMac, 6);
-                esp_now_send(mac, (uint8_t *)&resp, sizeof(resp));
-                lastHandshakeSent = now;
-            }
-        }
-
-
-        else if (isEliteControllerIdentity(msg))
-        {
-            uint8_t existingMac[6];
-            bool wasPaired = copyIliteMacFromISR(existingMac);
-            bool isNewPeer = !wasPaired || memcmp(existingMac, msg.mac, sizeof(existingMac)) != 0;
-            if (isNewPeer)
-            {
-                setIlitePeerFromISR(msg.mac);
-                updateCommandPeerFromISR(msg.mac);
-            }
-            esp_now_peer_info_t peerInfo = {};
-            memcpy(peerInfo.peer_addr, msg.mac, 6);
-            peerInfo.channel = 0;
-            peerInfo.encrypt = false;
-            if (!esp_now_is_peer_exist(msg.mac))
-            {
-                esp_now_add_peer(&peerInfo);
-            }
-            Comms::IdentityMessage ack = {};
-            ack.type = Comms::DRONE_ACK;
-            strncpy(ack.identity, DRONE_ID, sizeof(ack.identity));
-            memcpy(ack.mac, selfMac, 6);
-            esp_now_send(msg.mac, (uint8_t *)&ack, sizeof(ack));
-            lastHandshakeSent = now;
-            if (BUZZER_PIN >= 0 && isNewPeer)
-            {
-                beep(2000, 200); // short beep on pairing
-            }
-        }
-
-        return;
-    }
-
-    if (len == sizeof(ThegillCommand))
-    {
-        ThegillCommand incoming;
-        memcpy(&incoming, incomingData, sizeof(incoming));
-
-        // Ignore commands from unknown devices or with wrong magic
-        uint8_t pairedMac[6];
-        bool paired = copyIliteMacFromISR(pairedMac);
-        if (!paired || memcmp(mac, pairedMac, 6) != 0 || incoming.magic != THEGILL_PACKET_MAGIC)
-        {
-            return;
-        }
-
-        storeCommandSnapshotFromISR(incoming);
-        uint32_t nowMs = xTaskGetTickCountFromISR() * portTICK_PERIOD_MS;
-        setLastCommandTimeMsFromISR(nowMs);
-
-        bool peerChanged = updateCommandPeerFromISR(mac);
-        if (peerChanged)
-        {
-            esp_now_peer_info_t peerInfo = {};
-            memcpy(peerInfo.peer_addr, mac, 6);
-            peerInfo.channel = 0;
-            peerInfo.encrypt = false;
-            if (!esp_now_is_peer_exist(mac))
-            {
-                esp_now_add_peer(&peerInfo);
-            }
-        }
-    }
-}
+// ==================== FAILSAFE LOGIC ====================
 
 void checkFailsafe() {
     if (!failsafe_enable)
@@ -615,17 +443,17 @@ void checkFailsafe() {
 
     static bool rampingDown = false;
     static uint32_t lastRampUpdate = 0;
-    LinkStateSnapshot linkState = loadLinkStateSnapshot();
-    uint32_t nowMs = millis();
-    uint32_t lastCommandMs = linkState.lastCommandTimeMs;
 
-    if (lastCommandMs != 0 && nowMs - lastCommandMs <= FAILSAFE_TIMEOUT) {
+    uint32_t nowMs = millis();
+    uint32_t lastCommandMs = Comms::lastCommandTimestamp();
+    bool commandRecent = (lastCommandMs != 0 && nowMs >= lastCommandMs && (nowMs - lastCommandMs) <= FAILSAFE_TIMEOUT);
+
+    if (commandRecent) {
         rampingDown = false;
         return;
     }
 
-    if (!rampingDown)
-    {
+    if (!rampingDown) {
         rampingDown = true;
         lastRampUpdate = nowMs;
     }
@@ -657,12 +485,14 @@ void checkFailsafe() {
     rampValue(&safe.rightRear);
 
     if (changed) {
+        safe.flags |= GILL_FLAG_BRAKE;
         storeCommandSnapshot(safe);
         targetOutputs = commandToMotorOutputs(safe);
     } else {
         rampingDown = false;
     }
 }
+
 
 // ==================== CONTROL LOOP ====================
 
@@ -713,24 +543,160 @@ void FastTask(void *pvParameters) {
     }
 }
 
+
+static void StatusLedTask(void *pvParameters)
+{
+    (void)pvParameters;
+
+    enum class LedPattern : uint8_t {
+        Off,
+        Solid,
+        BlinkSlow,
+        BlinkMedium,
+        BlinkFast
+    };
+
+    constexpr unsigned long kRecentCommandWindowMs = 200;
+    const TickType_t slowPeriod = pdMS_TO_TICKS(1000);
+    const TickType_t mediumPeriod = pdMS_TO_TICKS(500);
+    const TickType_t fastPeriod = pdMS_TO_TICKS(150);
+    const TickType_t pollInterval = pdMS_TO_TICKS(50);
+
+    LedPattern previousPattern = LedPattern::Off;
+    bool ledState = false;
+    TickType_t lastToggle = xTaskGetTickCount();
+
+    digitalWrite(STATUS_LED_PIN, LOW);
+
+    while (true)
+    {
+        unsigned long nowMs = millis();
+        uint32_t lastCommand = Comms::lastCommandTimestamp();
+        bool paired = Comms::paired();
+        unsigned long ageMs = lastCommand ? (nowMs - static_cast<unsigned long>(lastCommand)) : (FAILSAFE_TIMEOUT + 1UL);
+
+        bool commandFresh = paired && lastCommand && ageMs <= kRecentCommandWindowMs;
+        bool failsafeActive = paired && ageMs > FAILSAFE_TIMEOUT;
+        bool idlePaired = paired && !commandFresh && !failsafeActive;
+
+        LedPattern pattern;
+        if (!paired)
+        {
+            pattern = LedPattern::BlinkSlow;
+        }
+        else if (failsafeActive)
+        {
+            pattern = LedPattern::BlinkFast;
+        }
+        else if (commandFresh)
+        {
+            pattern = LedPattern::Solid;
+        }
+        else if (idlePaired)
+        {
+            pattern = LedPattern::BlinkMedium;
+        }
+        else
+        {
+            pattern = LedPattern::Off;
+        }
+
+        if (pattern != previousPattern)
+        {
+            previousPattern = pattern;
+            lastToggle = xTaskGetTickCount();
+            switch (pattern)
+            {
+            case LedPattern::Solid:
+                ledState = true;
+                digitalWrite(STATUS_LED_PIN, HIGH);
+                break;
+            case LedPattern::Off:
+            default:
+                ledState = false;
+                digitalWrite(STATUS_LED_PIN, LOW);
+                break;
+            }
+        }
+
+        TickType_t nowTicks = xTaskGetTickCount();
+        auto handleBlink = [&](TickType_t period) {
+            if (nowTicks - lastToggle >= period)
+            {
+                ledState = !ledState;
+                digitalWrite(STATUS_LED_PIN, ledState ? HIGH : LOW);
+                lastToggle = nowTicks;
+            }
+        };
+
+        switch (pattern)
+        {
+        case LedPattern::BlinkSlow:
+            handleBlink(slowPeriod);
+            break;
+        case LedPattern::BlinkMedium:
+            handleBlink(mediumPeriod);
+            break;
+        case LedPattern::BlinkFast:
+            handleBlink(fastPeriod);
+            break;
+        case LedPattern::Solid:
+            if (!ledState)
+            {
+                ledState = true;
+                digitalWrite(STATUS_LED_PIN, HIGH);
+            }
+            break;
+        case LedPattern::Off:
+            if (ledState)
+            {
+                ledState = false;
+                digitalWrite(STATUS_LED_PIN, LOW);
+            }
+            break;
+        }
+
+        vTaskDelay(pollInterval);
+    }
+}
+
 void CommTask(void *pvParameters) {
     TickType_t lastWake = xTaskGetTickCount();
     const TickType_t interval = pdMS_TO_TICKS(5);
+    bool lastPaired = false;
+    uint8_t lastPeerMac[6] = {0};
+
     while (true) {
         handleIncomingData();
-        monitorConnection();
-        LinkStateSnapshot state = loadLinkStateSnapshot();
-        if (!state.ilitePaired && millis() - lastDiscoveryTime > 1000) {
-            Comms::IdentityMessage msg = {};
-            msg.type = Comms::DRONE_IDENTITY;
-            strncpy(msg.identity, DRONE_ID, sizeof(msg.identity));
-            memcpy(msg.mac, selfMac, 6);
-            esp_now_send(Comms::BroadcastMac, (uint8_t *)&msg, sizeof(msg));
-            lastDiscoveryTime = millis();
+        Comms::loop();
+
+        Comms::LinkStatus status = Comms::getLinkStatus();
+        if (status.paired) {
+            bool peerChanged = !lastPaired || !Comms::macEqual(status.peerMac, lastPeerMac);
+            if (peerChanged) {
+                memcpy(lastPeerMac, status.peerMac, sizeof(lastPeerMac));
+                if (BUZZER_PIN >= 0) {
+                    beep(2000, 200);
+                }
+            }
+        } else {
+            memset(lastPeerMac, 0, sizeof(lastPeerMac));
         }
-        vTaskDelayUntil(&lastWake, interval); // ~200 Hz for responsiveness
+        lastPaired = status.paired;
+
+        uint32_t timestampMs = 0;
+        ThegillCommand directCommand{};
+        Comms::ControlPacket packet{};
+        if (Comms::receiveThegillCommand(directCommand, &timestampMs)) {
+            applyThegillCommandPayload(directCommand, timestampMs);
+        } else if (Comms::receiveCommand(packet, &timestampMs)) {
+            applyControlPacket(packet, timestampMs);
+        }
+
+        vTaskDelayUntil(&lastWake, interval);
     }
 }
+
 
 void FailsafeTask(void *pvParameters) {
     TickType_t lastWake = xTaskGetTickCount();
@@ -762,6 +728,8 @@ void setup()
 {
     Serial.begin(115200);
     Serial.println("Thegill S3 controller starting...");
+    pinMode(STATUS_LED_PIN, OUTPUT);
+    digitalWrite(STATUS_LED_PIN, LOW);
     if (BUZZER_PIN >= 0) {
         // Use a standard 2 kHz buzzer tone with 8-bit resolution to avoid
         // disturbing the motor PWM timers.
@@ -782,7 +750,12 @@ void setup()
 
     setCpuFrequencyMhz(CPU_FREQ_MHZ);
 
-    if (!Comms::init(WIFI_SSID, WIFI_PASSWORD, TCP_PORT, onReceive)) {
+    Comms::setRole(Comms::DeviceRole::Controlled);
+    Comms::setPlatform("ThegillS3");
+    Comms::setCustomId(DRONE_ID);
+    Comms::setDeviceTypeOverride("THEGILL");
+
+    if (!Comms::init(WIFI_SSID, WIFI_PASSWORD, TCP_PORT)) {
         Serial.println("ESP-NOW init failed");
         while (true) {
             beep(2000, 500);
@@ -791,8 +764,11 @@ void setup()
     }
     ArduinoOTA.begin();
     server.begin();
-    WiFi.macAddress(selfMac);
-    Serial.println("ESP-NOW initialized");
+
+    Comms::Identity selfIdentity{};
+    Comms::fillSelfIdentity(selfIdentity);
+    Serial.print("ESP-NOW initialized as ");
+    Serial.println(Comms::macToString(selfIdentity.mac));
     Serial.println("OTA service started");
 
     // Initialize motor outputs
@@ -815,8 +791,7 @@ void setup()
     targetOutputs = {0, 0, 0, 0};
     Motor::update(false, false, currentOutputs, targetOutputs);
 
-    runMotorStartupTest();
-    setLastCommandTimeMs(millis());
+    // runMotorStartupTest();
 
     Serial.println("System ready for drive!");
     delay(200);
@@ -837,6 +812,15 @@ void setup()
         3,
         NULL,
         0 // Pin to core 0 for Wi-Fi operations
+    );
+
+    CREATE_TASK(
+        StatusLedTask,
+        "StatusLED",
+        STATUS_LED_TASK_STACK,
+        1,
+        NULL,
+        1
     );
 
     CREATE_TASK(
@@ -865,10 +849,10 @@ void setup()
         NULL,
         0
     );
-
 }
 // ==================== MAIN LOOP ====================
 
 void loop() {
     vTaskDelete(NULL); // Kill the default task
 }
+
