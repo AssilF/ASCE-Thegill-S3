@@ -31,15 +31,14 @@ constexpr uint32_t kMotorPwmFrequencyMidHigh = 16000;
 constexpr uint32_t kMotorPwmFrequencyHigh = 22000;
 
 constexpr MotorPinConfig kMotorPins[kMotorCount] = {
-    // Left side motors share orientation, right side are mirrored and inverted.
-    {16, 15, 0, 1, 0, false},  // Front left motor (H-bridge A1/A2)
-    {18, 17, 2, 3, 1, false},  // Rear left motor (H-bridge B1/B2)
-    {13, 14, 4, 5, 2, true},   // Front right motor (H-bridge C1/C2)
-    {11, 12, 6, 7, 3, true},   // Rear right motor (H-bridge D1/D2)
+    {19, 20, 0, 1, 0, false},  // Front left motor
+    {5, 4, 2, 3, 1, false},    // Rear left motor
+    {18, 17, 4, 5, 2, true},   // Front right motor
+    {7, 6, 6, 7, 3, true},     // Rear right motor
 };
 
-constexpr uint8_t kBuzzerPin = 47;
-constexpr uint8_t kBuzzerChannel = 0;
+constexpr uint8_t kBuzzerPin = 11;
+constexpr uint8_t kBuzzerChannel = 5;
 constexpr uint8_t kBuzzerResolutionBits = 10;
 constexpr uint8_t kBuzzerMinResolutionBits = 4;
 
@@ -52,5 +51,48 @@ constexpr uint8_t kPwmResolutionBits = 8;
 constexpr uint16_t kPwmMaxDuty = (1U << kPwmResolutionBits) - 1U;
 
 constexpr uint8_t kStatusLedPin = 48;
+
+constexpr uint8_t kShiftRegisterDataPin = 21;
+constexpr uint8_t kShiftRegisterClockPin = 36;
+constexpr uint8_t kShiftRegisterLatchPin = 35;
+constexpr uint32_t kShiftRegisterPwmFrequencyHz = 100000;
+constexpr uint8_t kShiftRegisterPwmResolutionBits = 8;
+
+constexpr uint8_t kArmBasePotPin = 1;
+constexpr uint8_t kArmExtensionPotPin = 2;
+constexpr uint8_t kAnalogMultiplexerInputPin = 3;
+
+constexpr uint8_t kServoShoulderPin = 13;
+constexpr uint8_t kServoElbowPin = 12;
+constexpr uint8_t kServoGripperPitchPin = 40;
+constexpr uint8_t kServoRollPin = 39;
+constexpr uint8_t kServoYawPin = 14;
+
+namespace arm {
+
+constexpr uint16_t kBaseAdcMin = 0;
+constexpr uint16_t kBaseAdcMax = 4095;
+constexpr bool kBaseInvertFeedback = false;
+constexpr bool kBaseInvertDirection = false;
+
+constexpr uint16_t kExtensionAdcMin = 0;
+constexpr uint16_t kExtensionAdcMax = 4095;
+constexpr bool kExtensionInvertFeedback = false;
+constexpr bool kExtensionInvertDirection = false;
+
+constexpr float kBaseKp = 4.5f;
+constexpr float kBaseKi = 0.35f;
+constexpr float kBaseKd = 0.12f;
+
+constexpr float kExtensionKp = 4.0f;
+constexpr float kExtensionKi = 0.30f;
+constexpr float kExtensionKd = 0.10f;
+
+constexpr float kIntegralLimit = 1.5f;
+constexpr float kOutputLimit = 0.9f;
+constexpr float kDeadband = 0.015f;
+constexpr float kSampleAlpha = 0.25f;
+
+} // namespace arm
 
 } // namespace config

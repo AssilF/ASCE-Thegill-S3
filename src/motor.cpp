@@ -4,6 +4,7 @@
 #include <cmath>
 
 #include "device_config.h"
+#include "shift_register.h"
 
 namespace Motor {
 namespace {
@@ -178,6 +179,8 @@ void IRAM_ATTR onPwmTimer() {
     }
 
     portEXIT_CRITICAL_ISR(&timerMux);
+
+    ShiftRegister::serviceIsr();
 }
 
 void configureDriver(size_t index, const DriverPins &pins) {

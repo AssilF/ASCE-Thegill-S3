@@ -9,19 +9,29 @@
 #include <freertos/portmacro.h>
 #include <cstring>
 #include <cstdlib>
+#include <cmath>
 #include "comms.h"
 #include "commands.h"
 #include "thegill.h"
 #include "motor.h"
 #include "device_config.h"
+#include "shift_register.h"
+#include "arm_control.h"
+#include "arm_servos.h"
 
 // ==================== BOARD CONFIGURATION ====================
 // ESP32-S3 pin mappings for BTS7960 bridge drivers and task sizes
-const Motor::DriverPins PINS_LEFT_FRONT  = {6,   5, -1};
-const Motor::DriverPins PINS_LEFT_REAR   = { 10, 9, -1};
-const Motor::DriverPins PINS_RIGHT_FRONT = { 7,  15, -1};
-const Motor::DriverPins PINS_RIGHT_REAR  = {   47, 21,  -1};
-const int BUZZER_PIN = 13; // optional piezo buzzer
+const Motor::DriverPins PINS_LEFT_FRONT  = {19, 20, -1};
+const Motor::DriverPins PINS_LEFT_REAR   = {5, 4, -1};
+const Motor::DriverPins PINS_RIGHT_FRONT = {18, 17, -1};
+const Motor::DriverPins PINS_RIGHT_REAR  = {7, 6, -1};
+const int BUZZER_PIN = config::kBuzzerPin; // optional piezo buzzer
+const int BUZZER_CHANNEL = config::kBuzzerChannel;
+const ShiftRegister::Pins SHIFT_REG_PINS = {
+    config::kShiftRegisterDataPin,
+    config::kShiftRegisterClockPin,
+    config::kShiftRegisterLatchPin
+};
 const uint32_t CPU_FREQ_MHZ = 240;
 const uint16_t FAST_TASK_STACK = 4096;
 const uint16_t COMM_TASK_STACK = 8192;
@@ -33,11 +43,10 @@ const uint16_t STATUS_LED_TASK_STACK = 1024;
 #define CREATE_TASK(fn, name, stack, prio, handle, core) xTaskCreatePinnedToCore(fn, name, stack, NULL, prio, handle, core)
 
 
-// Use LEDC channel 5 for an optional buzzer. This channel operates
-// independently of the MCPWM timers driving the motors.
-
-const int BUZZER_CHANNEL = 5;
 const int STATUS_LED_PIN = config::kStatusLedPin;
+constexpr auto SR_STATUS_LED_PRIMARY = ShiftRegister::Output::SystemIndicatorLed;
+constexpr auto SR_STATUS_LED_SECONDARY = ShiftRegister::Output::GripperIndicatorLed;
+constexpr auto SR_STATUS_LED_DEBUG = ShiftRegister::Output::ArmIndicatorLed;
 
 
 /// ==================== CONSTANTS ====================
@@ -80,6 +89,7 @@ const int MAX_MESSAGE_LENGTH = 256;
 char messageBuffer[MAX_MESSAGE_LENGTH + 1] = {0};
 size_t messageLength = 0;
 bool serialActive = false; // Tracks if a Serial session is currently open
+bool armControlEnabled = true;
 
 // ==================== IMPROVED COMMUNICATION FUNCTIONS ====================
 
@@ -499,6 +509,7 @@ void checkFailsafe() {
 void FastTask(void *pvParameters) {
     TickType_t lastWake = xTaskGetTickCount();
     const TickType_t interval = pdMS_TO_TICKS(2); // 500 Hz control loop
+    constexpr float kLoopDtSeconds = 0.002f;
     while (true) {
         ThegillCommand currentCommand = loadCommandSnapshot();
 
@@ -515,6 +526,8 @@ void FastTask(void *pvParameters) {
 
         targetOutputs = desired;
         Motor::update(isArmed, brake, currentOutputs, targetOutputs);
+        ArmControl::setOutputsEnabled(armControlEnabled);
+        ArmControl::update(kLoopDtSeconds);
 
         gillTelemetry.targetLeftFront = desired.leftFront / 1000.0f;
         gillTelemetry.targetLeftRear = desired.leftRear / 1000.0f;
@@ -548,112 +561,153 @@ static void StatusLedTask(void *pvParameters)
 {
     (void)pvParameters;
 
-    enum class LedPattern : uint8_t {
-        Off,
-        Solid,
-        BlinkSlow,
-        BlinkMedium,
-        BlinkFast
+    constexpr ShiftRegister::Output kLedOutputs[3] = {
+        SR_STATUS_LED_PRIMARY,
+        SR_STATUS_LED_SECONDARY,
+        SR_STATUS_LED_DEBUG
     };
 
-    constexpr unsigned long kRecentCommandWindowMs = 200;
-    const TickType_t slowPeriod = pdMS_TO_TICKS(1000);
-    const TickType_t mediumPeriod = pdMS_TO_TICKS(500);
-    const TickType_t fastPeriod = pdMS_TO_TICKS(150);
-    const TickType_t pollInterval = pdMS_TO_TICKS(50);
+    enum class LedMode : uint8_t {
+        SolidOn,
+        SolidOff,
+        BlinkSlow,
+        BlinkFast,
+        BlinkRandom,
+        PulseSlow,
+        PulseFast
+    };
 
-    LedPattern previousPattern = LedPattern::Off;
-    bool ledState = false;
-    TickType_t lastToggle = xTaskGetTickCount();
+    struct LedState {
+        LedMode mode;
+        TickType_t lastTick;
+        TickType_t nextInterval;
+        float phase;
+        bool level;
+    };
 
+    auto randomMode = []() -> LedMode {
+        const LedMode options[] = {
+            LedMode::SolidOn,
+            LedMode::SolidOff,
+            LedMode::BlinkSlow,
+            LedMode::BlinkFast,
+            LedMode::BlinkRandom,
+            LedMode::PulseSlow,
+            LedMode::PulseFast
+        };
+        uint32_t r = esp_random();
+        return options[r % (sizeof(options) / sizeof(options[0]))];
+    };
+
+    auto randomPhase = []() -> float {
+        return static_cast<float>(esp_random() & 0xFFFF) / 65536.0f;
+    };
+
+    TickType_t nowTicks = xTaskGetTickCount();
+    LedState states[3];
+    for (size_t i = 0; i < 3; ++i) {
+        states[i].mode = randomMode();
+        states[i].lastTick = nowTicks;
+        states[i].nextInterval = 0;
+        states[i].phase = randomPhase();
+        states[i].level = false;
+    }
+
+    auto applyInitial = [&](size_t index, TickType_t tick) {
+        LedState &state = states[index];
+        state.lastTick = tick;
+        state.level = false;
+        state.nextInterval = 0;
+        switch (state.mode) {
+        case LedMode::SolidOn:
+            state.level = true;
+            ShiftRegister::writeChannel(kLedOutputs[index], true);
+            break;
+        case LedMode::SolidOff:
+            ShiftRegister::writeChannel(kLedOutputs[index], false);
+            break;
+        case LedMode::BlinkRandom:
+            state.nextInterval = pdMS_TO_TICKS(100 + (esp_random() % 400));
+            ShiftRegister::writeChannel(kLedOutputs[index], state.level);
+            break;
+        default:
+            ShiftRegister::writeChannel(kLedOutputs[index], state.level);
+            break;
+        }
+    };
+
+    for (size_t i = 0; i < 3; ++i) {
+        applyInitial(i, nowTicks);
+    }
+
+    const TickType_t pollInterval = pdMS_TO_TICKS(20);
+    const TickType_t modeRefreshInterval = pdMS_TO_TICKS(3000);
+    TickType_t lastModeRefresh = nowTicks;
+
+    TickType_t boardLastToggle = nowTicks;
+    bool boardLevel = false;
     digitalWrite(STATUS_LED_PIN, LOW);
 
-    while (true)
-    {
+    while (true) {
+        nowTicks = xTaskGetTickCount();
         unsigned long nowMs = millis();
-        uint32_t lastCommand = Comms::lastCommandTimestamp();
-        bool paired = Comms::paired();
-        unsigned long ageMs = lastCommand ? (nowMs - static_cast<unsigned long>(lastCommand)) : (FAILSAFE_TIMEOUT + 1UL);
 
-        bool commandFresh = paired && lastCommand && ageMs <= kRecentCommandWindowMs;
-        bool failsafeActive = paired && ageMs > FAILSAFE_TIMEOUT;
-        bool idlePaired = paired && !commandFresh && !failsafeActive;
-
-        LedPattern pattern;
-        if (!paired)
-        {
-            pattern = LedPattern::BlinkSlow;
-        }
-        else if (failsafeActive)
-        {
-            pattern = LedPattern::BlinkFast;
-        }
-        else if (commandFresh)
-        {
-            pattern = LedPattern::Solid;
-        }
-        else if (idlePaired)
-        {
-            pattern = LedPattern::BlinkMedium;
-        }
-        else
-        {
-            pattern = LedPattern::Off;
+        if (nowTicks - boardLastToggle >= pdMS_TO_TICKS(500)) {
+            boardLevel = !boardLevel;
+            digitalWrite(STATUS_LED_PIN, boardLevel ? HIGH : LOW);
+            boardLastToggle = nowTicks;
         }
 
-        if (pattern != previousPattern)
-        {
-            previousPattern = pattern;
-            lastToggle = xTaskGetTickCount();
-            switch (pattern)
-            {
-            case LedPattern::Solid:
-                ledState = true;
-                digitalWrite(STATUS_LED_PIN, HIGH);
+        if (nowTicks - lastModeRefresh >= modeRefreshInterval) {
+            lastModeRefresh = nowTicks;
+            for (size_t i = 0; i < 3; ++i) {
+                states[i].mode = randomMode();
+                states[i].phase = randomPhase();
+                applyInitial(i, nowTicks);
+            }
+        }
+
+        for (size_t i = 0; i < 3; ++i) {
+            LedState &state = states[i];
+            switch (state.mode) {
+            case LedMode::SolidOn:
+                // nothing to do, already set
                 break;
-            case LedPattern::Off:
-            default:
-                ledState = false;
-                digitalWrite(STATUS_LED_PIN, LOW);
+            case LedMode::SolidOff:
+                break;
+            case LedMode::BlinkSlow:
+                if (nowTicks - state.lastTick >= pdMS_TO_TICKS(700)) {
+                    state.lastTick = nowTicks;
+                    state.level = !state.level;
+                    ShiftRegister::writeChannel(kLedOutputs[i], state.level);
+                }
+                break;
+            case LedMode::BlinkFast:
+                if (nowTicks - state.lastTick >= pdMS_TO_TICKS(200)) {
+                    state.lastTick = nowTicks;
+                    state.level = !state.level;
+                    ShiftRegister::writeChannel(kLedOutputs[i], state.level);
+                }
+                break;
+            case LedMode::BlinkRandom:
+                if (nowTicks - state.lastTick >= state.nextInterval) {
+                    state.lastTick = nowTicks;
+                    state.level = !state.level;
+                    ShiftRegister::writeChannel(kLedOutputs[i], state.level);
+                    state.nextInterval = pdMS_TO_TICKS(100 + (esp_random() % 400));
+                }
+                break;
+            case LedMode::PulseSlow:
+            case LedMode::PulseFast: {
+                float periodMs = (state.mode == LedMode::PulseSlow) ? 4000.0f : 1200.0f;
+                float timeMs = static_cast<float>(nowMs) + state.phase * periodMs;
+                float angle = (timeMs / periodMs) * 6.28318530718f;
+                float intensity = 0.5f * (1.0f - cosf(angle));
+                uint8_t duty = static_cast<uint8_t>(intensity * 255.0f);
+                ShiftRegister::writeChannelPwm(kLedOutputs[i], duty);
                 break;
             }
-        }
-
-        TickType_t nowTicks = xTaskGetTickCount();
-        auto handleBlink = [&](TickType_t period) {
-            if (nowTicks - lastToggle >= period)
-            {
-                ledState = !ledState;
-                digitalWrite(STATUS_LED_PIN, ledState ? HIGH : LOW);
-                lastToggle = nowTicks;
             }
-        };
-
-        switch (pattern)
-        {
-        case LedPattern::BlinkSlow:
-            handleBlink(slowPeriod);
-            break;
-        case LedPattern::BlinkMedium:
-            handleBlink(mediumPeriod);
-            break;
-        case LedPattern::BlinkFast:
-            handleBlink(fastPeriod);
-            break;
-        case LedPattern::Solid:
-            if (!ledState)
-            {
-                ledState = true;
-                digitalWrite(STATUS_LED_PIN, HIGH);
-            }
-            break;
-        case LedPattern::Off:
-            if (ledState)
-            {
-                ledState = false;
-                digitalWrite(STATUS_LED_PIN, LOW);
-            }
-            break;
         }
 
         vTaskDelay(pollInterval);
@@ -731,10 +785,9 @@ void setup()
     pinMode(STATUS_LED_PIN, OUTPUT);
     digitalWrite(STATUS_LED_PIN, LOW);
     if (BUZZER_PIN >= 0) {
-        // Use a standard 2 kHz buzzer tone with 8-bit resolution to avoid
-        // disturbing the motor PWM timers.
         ledcSetup(BUZZER_CHANNEL, 2000, 8);
         ledcAttachPin(BUZZER_PIN, BUZZER_CHANNEL);
+        ledcWrite(BUZZER_CHANNEL, 0);
         buzzerQueue = xQueueCreate(5, sizeof(BuzzerCommand));
         CREATE_TASK(
             BuzzerTask,
@@ -744,9 +797,29 @@ void setup()
             NULL,
             1
         );
-        beep(1000, 200);
-        beep(1180, 200);
+        const uint16_t bootNotes[] = {523, 659, 784};
+        for (uint8_t i = 0; i < sizeof(bootNotes) / sizeof(bootNotes[0]); ++i) {
+            beep(bootNotes[i], 160);
+        }
     }
+
+    if (!ShiftRegister::init(
+            SHIFT_REG_PINS,
+            config::kShiftRegisterPwmFrequencyHz,
+            config::kShiftRegisterPwmResolutionBits)) {
+        Serial.println("Shift register init failed");
+        while (true) {
+            digitalWrite(STATUS_LED_PIN, HIGH);
+            delay(120);
+            digitalWrite(STATUS_LED_PIN, LOW);
+            delay(120);
+        }
+    }
+
+    ArmControl::init();
+    ArmControl::setOutputsEnabled(armControlEnabled);
+    ArmServos::init();
+    ArmServos::setEnabled(armControlEnabled);
 
     setCpuFrequencyMhz(CPU_FREQ_MHZ);
 
@@ -849,6 +922,7 @@ void setup()
         NULL,
         0
     );
+    Serial.println("Tasks are here boi!");
 }
 // ==================== MAIN LOOP ====================
 
