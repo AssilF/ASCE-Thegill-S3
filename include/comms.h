@@ -50,6 +50,9 @@ struct ControlPacket {
     int8_t speed;
     uint8_t motionState;
     uint8_t buttonStates[3];
+    uint8_t ledPwm[3];       // PWM duty (0-255) for each high-power LED
+    uint8_t pumpIntensity;   // Pump PWM duty (0-255)
+    uint8_t commandByte;     // Bitmask for auxiliary user outputs/commands
 };
 #pragma pack(pop)
 
@@ -86,8 +89,10 @@ void loop();
 
 bool receiveCommand(ControlPacket &cmd, uint32_t *timestampMs = nullptr);
 bool receiveThegillCommand(ThegillCommand &cmd, uint32_t *timestampMs = nullptr);
+bool receiveArmCommand(ArmControlCommand &cmd, uint32_t *timestampMs = nullptr);
 uint32_t lastCommandTimestamp();
 uint32_t lastThegillCommandTimestamp();
+uint32_t lastArmCommandTimestamp();
 LinkStatus getLinkStatus();
 bool paired();
 

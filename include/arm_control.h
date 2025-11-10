@@ -28,12 +28,18 @@ bool outputsEnabled();
 
 void setBaseTargetNormalized(float value);
 void setExtensionTargetNormalized(float value);
+void setBaseTargetDegrees(float degrees);
+void setExtensionTargetCentimeters(float centimeters);
 
 float baseTargetNormalized();
 float extensionTargetNormalized();
+float baseTargetDegrees();
+float extensionTargetCentimeters();
 
 float basePositionNormalized();
 float extensionPositionNormalized();
+float basePositionDegrees();
+float extensionPositionCentimeters();
 
 Status status();
 

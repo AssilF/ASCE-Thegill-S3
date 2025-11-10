@@ -11,6 +11,14 @@ namespace {
 
 constexpr size_t MAX_DISCOVERY_ENTRIES = 8;
 
+struct LegacyControlPacket {
+    uint8_t replyIndex;
+    int8_t speed;
+    uint8_t motionState;
+    uint8_t buttonStates[3];
+};
+static_assert(sizeof(LegacyControlPacket) == 6, "Legacy ControlPacket size mismatch");
+
 DeviceRole g_role = DEVICE_ROLE;
 TargetSelector g_targetSelector = nullptr;
 
@@ -30,6 +38,10 @@ uint32_t g_lastCommandTimestamp = 0;
 ThegillCommand g_lastThegillCommand{};
 bool g_pendingThegillCommand = false;
 uint32_t g_lastThegillCommandTimestamp = 0;
+
+ArmControlCommand g_lastArmCommand{};
+bool g_pendingArmCommand = false;
+uint32_t g_lastArmCommandTimestamp = 0;
 
 bool g_initialized = false;
 uint32_t g_lastBroadcastMs = 0;
@@ -134,8 +146,10 @@ void clearLinkStatus() {
     g_linkStatus = LinkStatus{};
     g_pendingCommand = false;
     g_pendingThegillCommand = false;
+    g_pendingArmCommand = false;
     g_lastCommandTimestamp = 0;
     g_lastThegillCommandTimestamp = 0;
+    g_lastArmCommandTimestamp = 0;
 }
 
 void handlePairAck(uint32_t nowMs, const uint8_t mac[6], const Packet &packet) {
@@ -237,14 +251,44 @@ void onDataRecv(const uint8_t *mac, const uint8_t *incomingData, int len) {
         }
 
         g_linkStatus.lastActivityMs = nowMs;
-    } else if (len == static_cast<int>(sizeof(ControlPacket))) {
+    } else if (len == static_cast<int>(sizeof(ControlPacket)) ||
+               len == static_cast<int>(sizeof(LegacyControlPacket))) {
         if (g_linkStatus.paired && macEqualBytes(mac, g_linkStatus.peerMac)) {
-            const ControlPacket *packet = reinterpret_cast<const ControlPacket *>(incomingData);
-            g_lastCommand = *packet;
+            ControlPacket decoded{};
+            const size_t copyLen = static_cast<size_t>(len);
+            std::memcpy(&decoded, incomingData, copyLen);
+            g_lastCommand = decoded;
             g_pendingCommand = true;
             g_lastCommandTimestamp = nowMs;
             g_linkStatus.lastCommandMs = nowMs;
             g_linkStatus.lastActivityMs = nowMs;
+        }
+    } else if (len >= static_cast<int>(sizeof(ArmControlCommand))) {
+        const ArmControlCommand *packet = reinterpret_cast<const ArmControlCommand *>(incomingData);
+        if (packet->magic == ARM_COMMAND_MAGIC) {
+            bool fromBroadcast = macEqualBytes(mac, BroadcastMac);
+            bool fromPeer = g_linkStatus.paired && macEqualBytes(mac, g_linkStatus.peerMac);
+
+            if (!g_linkStatus.paired && !fromBroadcast) {
+                g_linkStatus.paired = true;
+                g_linkStatus.peerIdentity = Identity{};
+                std::memcpy(g_linkStatus.peerIdentity.mac, mac, 6);
+                std::memcpy(g_linkStatus.peerMac, mac, 6);
+                g_pendingCommand = false;
+                g_pendingThegillCommand = false;
+                g_pendingArmCommand = false;
+                ensurePeer(mac);
+                fromPeer = true;
+            }
+
+            if (fromPeer || (fromBroadcast && g_linkStatus.paired)) {
+                g_lastArmCommand = *packet;
+                g_pendingArmCommand = true;
+                g_lastArmCommandTimestamp = nowMs;
+                g_lastCommandTimestamp = nowMs;
+                g_linkStatus.lastCommandMs = nowMs;
+                g_linkStatus.lastActivityMs = nowMs;
+            }
         }
     } else if (len >= static_cast<int>(sizeof(ThegillCommand))) {
         const ThegillCommand *packet = reinterpret_cast<const ThegillCommand *>(incomingData);
@@ -258,6 +302,7 @@ void onDataRecv(const uint8_t *mac, const uint8_t *incomingData, int len) {
                 std::memcpy(g_linkStatus.peerIdentity.mac, mac, 6);
                 std::memcpy(g_linkStatus.peerMac, mac, 6);
                 g_pendingCommand = false;
+                g_pendingArmCommand = false;
                 ensurePeer(mac);
                 fromPeer = true;
             }
@@ -431,6 +476,19 @@ bool receiveCommand(ControlPacket &cmd, uint32_t *timestampMs) {
     return true;
 }
 
+bool receiveArmCommand(ArmControlCommand &cmd, uint32_t *timestampMs) {
+    if (!g_pendingArmCommand) {
+        return false;
+    }
+
+    cmd = g_lastArmCommand;
+    if (timestampMs) {
+        *timestampMs = g_lastArmCommandTimestamp;
+    }
+    g_pendingArmCommand = false;
+    return true;
+}
+
 bool receiveThegillCommand(ThegillCommand &cmd, uint32_t *timestampMs) {
     if (!g_pendingThegillCommand) {
         return false;
@@ -445,11 +503,17 @@ bool receiveThegillCommand(ThegillCommand &cmd, uint32_t *timestampMs) {
 }
 
 uint32_t lastCommandTimestamp() {
-    return std::max(g_lastCommandTimestamp, g_lastThegillCommandTimestamp);
+    uint32_t latest = std::max(g_lastCommandTimestamp, g_lastThegillCommandTimestamp);
+    latest = std::max(latest, g_lastArmCommandTimestamp);
+    return latest;
 }
 
 uint32_t lastThegillCommandTimestamp() {
     return g_lastThegillCommandTimestamp;
+}
+
+uint32_t lastArmCommandTimestamp() {
+    return g_lastArmCommandTimestamp;
 }
 
 LinkStatus getLinkStatus() {

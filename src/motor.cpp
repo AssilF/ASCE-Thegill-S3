@@ -2,9 +2,11 @@
 
 #include <Arduino.h>
 #include <cmath>
+#include <algorithm>
 
 #include "device_config.h"
 #include "shift_register.h"
+#include "pcint_encoder.h"
 
 namespace Motor {
 namespace {
@@ -40,6 +42,7 @@ constexpr uint8_t kActiveReverse = 2;
 constexpr float kCommandScale = 1000.0f;
 constexpr float kCommandDeadband = config::kMotorCommandDeadband;
 constexpr float kCommandDeadbandCounts = kCommandDeadband * kCommandScale;
+constexpr float kMetersPerTick = config::kMetersPerEncoderTick;
 
 DriverState drivers[kMotorCount];
 PwmState pwmStates[kMotorCount];
@@ -48,6 +51,15 @@ hw_timer_t *pwmTimer = nullptr;
 portMUX_TYPE timerMux = portMUX_INITIALIZER_UNLOCKED;
 volatile uint64_t currentTicks = 0;
 volatile uint32_t alarmInterval = kDefaultIdleInterval;
+
+struct EncoderSample {
+    EncoderMeasurement measurement{};
+    int32_t lastTicks{0};
+    uint64_t lastMicros{0};
+    bool initialised{false};
+};
+
+EncoderSample encoderSamples[kMotorCount];
 
 inline int16_t applyCommandDeadband(int16_t value) {
     if (fabsf(static_cast<float>(value)) <= kCommandDeadbandCounts) {
@@ -179,8 +191,6 @@ void IRAM_ATTR onPwmTimer() {
     }
 
     portEXIT_CRITICAL_ISR(&timerMux);
-
-    ShiftRegister::serviceIsr();
 }
 
 void configureDriver(size_t index, const DriverPins &pins) {
@@ -305,6 +315,68 @@ void applyOutput(size_t index, int16_t command, bool outputsEnabled, bool brake)
     }
 }
 
+inline float ticksToMeters(int32_t ticks) {
+    return kMetersPerTick * static_cast<float>(ticks);
+}
+
+void updateEncoderSample(std::size_t index, uint64_t nowMicros) {
+    if (!PcintEncoder::configured() || index >= PcintEncoder::encoderCount()) {
+        encoderSamples[index].measurement.valid = false;
+        encoderSamples[index].initialised = false;
+        return;
+    }
+
+    PcintEncoder::EncoderReading reading = PcintEncoder::read(index);
+    EncoderSample &sample = encoderSamples[index];
+    sample.measurement.totalTicks = reading.total;
+    sample.measurement.metersTravelled = ticksToMeters(reading.total);
+    sample.measurement.valid = reading.valid && PcintEncoder::enabled();
+
+    if (!sample.measurement.valid) {
+        sample.initialised = false;
+        sample.measurement.metersPerSecond = 0.0f;
+        return;
+    }
+
+    if (!sample.initialised) {
+        sample.lastTicks = reading.total;
+        sample.lastMicros = nowMicros;
+        sample.measurement.metersPerSecond = 0.0f;
+        sample.initialised = true;
+        return;
+    }
+
+    uint64_t deltaMicros = nowMicros - sample.lastMicros;
+    int32_t deltaTicks = reading.total - sample.lastTicks;
+
+    float deltaSeconds =
+        (deltaMicros == 0) ? 0.0f : static_cast<float>(deltaMicros) * 1e-6f;
+    float deltaMeters = ticksToMeters(deltaTicks);
+    if (deltaSeconds > 0.0f) {
+        sample.measurement.metersPerSecond = deltaMeters / deltaSeconds;
+    } else {
+        sample.measurement.metersPerSecond = 0.0f;
+    }
+
+    sample.lastTicks = reading.total;
+    sample.lastMicros = nowMicros;
+}
+
+void updateEncoderSamples() {
+    if (kMetersPerTick == 0.0f) {
+        for (std::size_t i = 0; i < kMotorCount; ++i) {
+            encoderSamples[i].measurement.valid = false;
+            encoderSamples[i].initialised = false;
+        }
+        return;
+    }
+
+    uint64_t nowMicros = micros();
+    for (std::size_t i = 0; i < kMotorCount; ++i) {
+        updateEncoderSample(i, nowMicros);
+    }
+}
+
 }  // namespace
 
 void Outputs::constrainAll() {
@@ -388,7 +460,30 @@ void update(bool enabled, bool brake, Outputs &current, const Outputs &target) {
     next.rightRear = rr;
 
     current = next;
+
+    updateEncoderSamples();
 }
 
 }  // namespace Motor
 
+bool Motor::encoderMeasurement(std::size_t index, EncoderMeasurement &out) {
+    if (index >= kMotorCount) {
+        out = {};
+        return false;
+    }
+    out = encoderSamples[index].measurement;
+    return out.valid;
+}
+
+std::size_t Motor::encoderMeasurements(EncoderMeasurement *out,
+                                       std::size_t maxCount) {
+    if (!out || maxCount == 0) {
+        return 0;
+    }
+    std::size_t count =
+        std::min<std::size_t>(kMotorCount, maxCount);
+    for (std::size_t i = 0; i < count; ++i) {
+        out[i] = encoderSamples[i].measurement;
+    }
+    return count;
+}

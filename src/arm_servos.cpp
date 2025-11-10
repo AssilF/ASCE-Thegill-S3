@@ -1,13 +1,7 @@
 #include "arm_servos.h"
 
 #include <Arduino.h>
-
-#if defined(ARDUINO_ARCH_ESP32)
-#include <ESP32Servo.h>
-#else
-#include <Servo.h>
-#endif
-
+#include <esp_timer.h>
 #include <cmath>
 
 #include "device_config.h"
@@ -34,16 +28,16 @@ constexpr ServoConfig kConfigs[kServoCount] = {
     {config::kServoYawPin, 0.0f, 180.0f, 500, 2500, 90.0f},
 };
 
-#if defined(ARDUINO_ARCH_ESP32)
-Servo gServos[kServoCount];
-#else
-Servo gServos[kServoCount];
-#endif
-
 float gTargets[kServoCount];
-bool gAttached[kServoCount];
 bool gEnabled = true;
 bool gInitialised = false;
+
+// Servo pulse scheduling (50 Hz frame)
+constexpr uint32_t kFramePeriodUs = 20000; // 20 ms
+esp_timer_handle_t gFrameTimer = nullptr;  // periodic frame timer
+esp_timer_handle_t gOffTimers[kServoCount] = {nullptr}; // per-servo oneshot to drive pin low
+uint8_t gPins[kServoCount];
+bool gActive[kServoCount];
 
 constexpr float clampf(float value, float minValue, float maxValue) {
     return (value < minValue) ? minValue : (value > maxValue ? maxValue : value);
@@ -53,57 +47,78 @@ constexpr size_t toIndex(ServoId id) {
     return static_cast<size_t>(id);
 }
 
-void applyTarget(size_t index) {
-    if (!gEnabled || !gAttached[index]) {
-        return;
-    }
-    gServos[index].write(static_cast<int>(std::lround(gTargets[index])));
+uint32_t degreesToMicros(size_t index, float degrees) {
+    const ServoConfig &cfg = kConfigs[index];
+    float d = clampf(degrees, cfg.minDegrees, cfg.maxDegrees);
+    float spanDeg = (cfg.maxDegrees - cfg.minDegrees);
+    if (spanDeg <= 0.0f) spanDeg = 180.0f;
+    float t = (d - cfg.minDegrees) / spanDeg; // 0..1
+    uint32_t spanUs = static_cast<uint32_t>(cfg.maxPulseMicros - cfg.minPulseMicros);
+    return static_cast<uint32_t>(cfg.minPulseMicros + t * spanUs);
 }
 
-void attachServo(size_t index) {
-    if (gAttached[index]) {
-        return;
+void IRAM_ATTR offTimerCallback(void *arg) {
+    size_t idx = reinterpret_cast<size_t>(arg);
+    if (idx < kServoCount) {
+        digitalWrite(gPins[idx], LOW);
     }
-#if defined(ARDUINO_ARCH_ESP32)
-    gServos[index].setPeriodHertz(50);
-#endif
-    gServos[index].attach(kConfigs[index].pin,
-                          kConfigs[index].minPulseMicros,
-                          kConfigs[index].maxPulseMicros);
-    gAttached[index] = gServos[index].attached();
-    applyTarget(index);
 }
 
-void detachServo(size_t index) {
-    if (!gAttached[index]) {
-        return;
+void frameTimerCallback(void *arg) {
+    (void)arg;
+    if (!gEnabled) return;
+    // Start-of-frame: drive all active servo pins HIGH, then arm oneshots to pull LOW at each pulse width
+    for (size_t i = 0; i < kServoCount; ++i) {
+        if (!gActive[i]) continue;
+        digitalWrite(gPins[i], HIGH);
+        uint32_t pw = degreesToMicros(i, gTargets[i]);
+        // Clamp pulse to sane range (500..2500 us)
+        const ServoConfig &cfg = kConfigs[i];
+        if (pw < cfg.minPulseMicros) pw = cfg.minPulseMicros;
+        if (pw > cfg.maxPulseMicros) pw = cfg.maxPulseMicros;
+        if (gOffTimers[i]) {
+            esp_timer_stop(gOffTimers[i]);
+            esp_timer_start_once(gOffTimers[i], pw);
+        }
     }
-    gServos[index].detach();
-    gAttached[index] = false;
+}
+
+void ensureTimersCreated() {
+    if (!gFrameTimer) {
+        esp_timer_create_args_t fa{};
+        fa.callback = &frameTimerCallback;
+        fa.arg = nullptr;
+        fa.dispatch_method = ESP_TIMER_TASK;
+        fa.name = "servo_frame";
+        esp_timer_create(&fa, &gFrameTimer);
+    }
+    for (size_t i = 0; i < kServoCount; ++i) {
+        if (!gOffTimers[i]) {
+            esp_timer_create_args_t oa{};
+            oa.callback = &offTimerCallback;
+            oa.arg = reinterpret_cast<void*>(i);
+            oa.dispatch_method = ESP_TIMER_TASK;
+            oa.name = "servo_off";
+            esp_timer_create(&oa, &gOffTimers[i]);
+        }
+    }
 }
 
 } // namespace
 
 void init() {
-#if defined(ARDUINO_ARCH_ESP32)
-    ESP32PWM::allocateTimer(0);
-    ESP32PWM::allocateTimer(1);
-    ESP32PWM::allocateTimer(2);
-    ESP32PWM::allocateTimer(3);
-#endif
-
     for (size_t i = 0; i < kServoCount; ++i) {
-        pinMode(kConfigs[i].pin, OUTPUT);
+        gPins[i] = kConfigs[i].pin;
+        pinMode(gPins[i], OUTPUT);
+        digitalWrite(gPins[i], LOW);
         gTargets[i] = kConfigs[i].defaultDegrees;
-        gAttached[i] = false;
+        gActive[i] = true;
     }
 
+    ensureTimersCreated();
     gInitialised = true;
-
-    if (gEnabled) {
-        for (size_t i = 0; i < kServoCount; ++i) {
-            attachServo(i);
-        }
+    if (gEnabled && gFrameTimer) {
+        esp_timer_start_periodic(gFrameTimer, kFramePeriodUs);
     }
 }
 
@@ -115,13 +130,15 @@ void setEnabled(bool enabled) {
     if (!gInitialised) {
         return;
     }
-    if (gEnabled) {
-        for (size_t i = 0; i < kServoCount; ++i) {
-            attachServo(i);
-        }
-    } else {
-        for (size_t i = 0; i < kServoCount; ++i) {
-            detachServo(i);
+    if (gFrameTimer) {
+        if (gEnabled) {
+            esp_timer_start_periodic(gFrameTimer, kFramePeriodUs);
+        } else {
+            esp_timer_stop(gFrameTimer);
+            // Ensure all outputs LOW
+            for (size_t i = 0; i < kServoCount; ++i) {
+                digitalWrite(gPins[i], LOW);
+            }
         }
     }
 }
@@ -142,13 +159,6 @@ bool setTargetDegrees(ServoId id, float degrees) {
     }
     degrees = clampf(degrees, minDeg, maxDeg);
     gTargets[index] = degrees;
-    if (gEnabled && gInitialised) {
-        if (!gAttached[index]) {
-            attachServo(index);
-        } else {
-            applyTarget(index);
-        }
-    }
     return true;
 }
 
@@ -194,7 +204,7 @@ ServoStatus status(ServoId id) {
     }
     info.id = id;
     info.enabled = gEnabled;
-    info.attached = gAttached[index] && gServos[index].attached();
+    info.attached = gEnabled && gActive[index];
     info.targetDegrees = gTargets[index];
     info.minDegrees = kConfigs[index].minDegrees;
     info.maxDegrees = kConfigs[index].maxDegrees;

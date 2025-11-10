@@ -3,6 +3,8 @@
 #include <WiFi.h>
 #include <WiFiClient.h>
 #include <esp_now.h>
+#include <esp_system.h>
+#include <esp_timer.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/queue.h>
 #include <freertos/task.h>
@@ -10,14 +12,17 @@
 #include <cstring>
 #include <cstdlib>
 #include <cmath>
+#include "analog_inputs.h"
 #include "comms.h"
 #include "commands.h"
 #include "thegill.h"
 #include "motor.h"
 #include "device_config.h"
 #include "shift_register.h"
+#include "pcint_encoder.h"
 #include "arm_control.h"
 #include "arm_servos.h"
+#include "peripheral_test.h"
 
 // ==================== BOARD CONFIGURATION ====================
 // ESP32-S3 pin mappings for BTS7960 bridge drivers and task sizes
@@ -146,6 +151,92 @@ static int16_t decodeMotionBits(uint8_t encoded, int16_t magnitude, bool &brakeR
     }
 }
 
+// Apply LED, pump, and auxiliary user-output values from the control stream.
+static void applyPeripheralOutputs(const Comms::ControlPacket &packet)
+{
+    if (!ShiftRegister::initialized())
+    {
+        return;
+    }
+
+    constexpr ShiftRegister::Output kHighPowerLeds[3] = {
+        ShiftRegister::Output::HighPowerLed1,
+        ShiftRegister::Output::HighPowerLed2,
+        ShiftRegister::Output::HighPowerLed3,
+    };
+
+    bool overrideOutputs = PeripheralTest::overridesPeripheralOutputs();
+
+    if (!overrideOutputs)
+    {
+        for (uint8_t i = 0; i < 3; ++i)
+        {
+            ShiftRegister::writeChannelPwm(kHighPowerLeds[i], packet.ledPwm[i]);
+        }
+
+        ShiftRegister::writeChannelPwm(ShiftRegister::Output::PumpControl, packet.pumpIntensity);
+    }
+
+    ShiftRegister::writeUserMask(packet.commandByte);
+}
+
+static void applyArmControlCommand(const ArmControlCommand &packet, uint32_t timestampMs)
+{
+    (void)timestampMs;
+
+    bool requestEnableOutputs = (packet.flags & ArmCommandFlag::EnableOutputs) != 0;
+    bool requestDisableOutputs = (packet.flags & ArmCommandFlag::DisableOutputs) != 0;
+    if (requestEnableOutputs && !requestDisableOutputs)
+    {
+        armControlEnabled = true;
+        ArmControl::setOutputsEnabled(true);
+    }
+    else if (requestDisableOutputs && !requestEnableOutputs)
+    {
+        armControlEnabled = false;
+        ArmControl::setOutputsEnabled(false);
+    }
+
+    bool requestEnableServos = (packet.flags & ArmCommandFlag::EnableServos) != 0;
+    bool requestDisableServos = (packet.flags & ArmCommandFlag::DisableServos) != 0;
+    if (requestEnableServos && !requestDisableServos)
+    {
+        ArmServos::setEnabled(true);
+    }
+    else if (requestDisableServos && !requestEnableServos)
+    {
+        ArmServos::setEnabled(false);
+    }
+
+    if (packet.validMask & ArmCommandMask::Extension)
+    {
+        float centimeters = packet.extensionMillimeters * 0.1f;
+        ArmControl::setExtensionTargetCentimeters(centimeters);
+    }
+    if (packet.validMask & ArmCommandMask::Shoulder)
+    {
+        ArmServos::setTargetDegrees(ArmServos::ServoId::Shoulder, packet.shoulderDegrees);
+    }
+    if (packet.validMask & ArmCommandMask::Elbow)
+    {
+        ArmServos::setTargetDegrees(ArmServos::ServoId::Elbow, packet.elbowDegrees);
+    }
+    if (packet.validMask & ArmCommandMask::Pitch)
+    {
+        ArmServos::setTargetDegrees(ArmServos::ServoId::Pitch, packet.pitchDegrees);
+    }
+    if (packet.validMask & ArmCommandMask::Roll)
+    {
+        ArmServos::setTargetDegrees(ArmServos::ServoId::Roll, packet.rollDegrees);
+    }
+    if (packet.validMask & ArmCommandMask::Yaw)
+    {
+        ArmServos::setTargetDegrees(ArmServos::ServoId::Yaw, packet.yawDegrees);
+    }
+
+    armControlEnabled = ArmControl::outputsEnabled();
+}
+
 static void applyControlPacket(const Comms::ControlPacket &packet, uint32_t timestampMs)
 {
     (void)timestampMs;
@@ -176,6 +267,7 @@ static void applyControlPacket(const Comms::ControlPacket &packet, uint32_t time
     updated.flags = flags;
 
     storeCommandSnapshot(updated);
+    applyPeripheralOutputs(packet);
 }
 
 static void applyThegillCommandPayload(const ThegillCommand &packet, uint32_t timestampMs)
@@ -289,6 +381,40 @@ void BuzzerTask(void *pvParameters)
         }
 
         ledcWrite(BUZZER_CHANNEL, 0);
+    }
+}
+
+static void runBuzzerSelfTest()
+{
+    if (BUZZER_PIN < 0)
+    {
+        return;
+    }
+
+    Serial.println("Running buzzer self-test...");
+    constexpr uint16_t kSweep[] = {440, 660, 880, 660};
+    constexpr uint16_t kToneDurationMs = 140;
+    constexpr uint16_t kGapMs = 60;
+
+    for (uint8_t i = 0; i < sizeof(kSweep) / sizeof(kSweep[0]); ++i)
+    {
+        ledcWriteTone(BUZZER_CHANNEL, kSweep[i]);
+        delay(kToneDurationMs);
+        ledcWrite(BUZZER_CHANNEL, 0);
+        delay(kGapMs);
+    }
+
+    Serial.println("Buzzer self-test complete");
+}
+
+static void playImmediateStartupTone()
+{
+    for(int i=0l; i <100;i++)
+    {
+    digitalWrite(BUZZER_PIN,1);
+    delay(2);
+    digitalWrite(BUZZER_PIN,0);
+    delay(2);
     }
 }
 
@@ -466,6 +592,12 @@ void checkFailsafe() {
     if (!rampingDown) {
         rampingDown = true;
         lastRampUpdate = nowMs;
+        // Immediately drop all shift-register outputs (LEDs, pump, aux) to avoid unintended actuation
+        if (ShiftRegister::initialized()) {
+            ShiftRegister::clearAll();
+        }
+        // Disable arm outputs so STBY stays low and PID idles
+        ArmControl::setOutputsEnabled(false);
     }
 
     const uint32_t rampIntervalMs = 50;
@@ -561,156 +693,49 @@ static void StatusLedTask(void *pvParameters)
 {
     (void)pvParameters;
 
-    constexpr ShiftRegister::Output kLedOutputs[3] = {
-        SR_STATUS_LED_PRIMARY,
-        SR_STATUS_LED_SECONDARY,
-        SR_STATUS_LED_DEBUG
+    struct LedPattern {
+        ShiftRegister::Output output;
+        float periodMs;
+        float phaseOffsetMs;
     };
 
-    enum class LedMode : uint8_t {
-        SolidOn,
-        SolidOff,
-        BlinkSlow,
-        BlinkFast,
-        BlinkRandom,
-        PulseSlow,
-        PulseFast
+    constexpr LedPattern kPatterns[] = {
+        {SR_STATUS_LED_PRIMARY,   3200.0f,   0.0f},  // Slow breath
+        {SR_STATUS_LED_SECONDARY, 1600.0f, 240.0f},  // Medium breath
+        {SR_STATUS_LED_DEBUG,      900.0f, 480.0f},  // Fast breath
     };
 
-    struct LedState {
-        LedMode mode;
-        TickType_t lastTick;
-        TickType_t nextInterval;
-        float phase;
-        bool level;
-    };
+    constexpr float kTwoPi = 6.28318530718f;
+    const TickType_t sleepTicks = pdMS_TO_TICKS(15);
 
-    auto randomMode = []() -> LedMode {
-        const LedMode options[] = {
-            LedMode::SolidOn,
-            LedMode::SolidOff,
-            LedMode::BlinkSlow,
-            LedMode::BlinkFast,
-            LedMode::BlinkRandom,
-            LedMode::PulseSlow,
-            LedMode::PulseFast
-        };
-        uint32_t r = esp_random();
-        return options[r % (sizeof(options) / sizeof(options[0]))];
-    };
-
-    auto randomPhase = []() -> float {
-        return static_cast<float>(esp_random() & 0xFFFF) / 65536.0f;
-    };
-
-    TickType_t nowTicks = xTaskGetTickCount();
-    LedState states[3];
-    for (size_t i = 0; i < 3; ++i) {
-        states[i].mode = randomMode();
-        states[i].lastTick = nowTicks;
-        states[i].nextInterval = 0;
-        states[i].phase = randomPhase();
-        states[i].level = false;
-    }
-
-    auto applyInitial = [&](size_t index, TickType_t tick) {
-        LedState &state = states[index];
-        state.lastTick = tick;
-        state.level = false;
-        state.nextInterval = 0;
-        switch (state.mode) {
-        case LedMode::SolidOn:
-            state.level = true;
-            ShiftRegister::writeChannel(kLedOutputs[index], true);
-            break;
-        case LedMode::SolidOff:
-            ShiftRegister::writeChannel(kLedOutputs[index], false);
-            break;
-        case LedMode::BlinkRandom:
-            state.nextInterval = pdMS_TO_TICKS(100 + (esp_random() % 400));
-            ShiftRegister::writeChannel(kLedOutputs[index], state.level);
-            break;
-        default:
-            ShiftRegister::writeChannel(kLedOutputs[index], state.level);
-            break;
-        }
-    };
-
-    for (size_t i = 0; i < 3; ++i) {
-        applyInitial(i, nowTicks);
-    }
-
-    const TickType_t pollInterval = pdMS_TO_TICKS(20);
-    const TickType_t modeRefreshInterval = pdMS_TO_TICKS(3000);
-    TickType_t lastModeRefresh = nowTicks;
-
-    TickType_t boardLastToggle = nowTicks;
+    TickType_t boardLastToggle = xTaskGetTickCount();
     bool boardLevel = false;
     digitalWrite(STATUS_LED_PIN, LOW);
 
     while (true) {
-        nowTicks = xTaskGetTickCount();
-        unsigned long nowMs = millis();
+        uint64_t nowUs = esp_timer_get_time();
+        for (const auto &pattern : kPatterns) {
+            float effectiveMs = static_cast<float>(nowUs) / 1000.0f + pattern.phaseOffsetMs;
+            if (pattern.periodMs <= 0.0f) {
+                ShiftRegister::writeChannel(pattern.output, false);
+                continue;
+            }
+            float cycles = effectiveMs / pattern.periodMs;
+            float fractional = cycles - floorf(cycles);
+            float angle = fractional * kTwoPi;
+            float intensity = 0.5f * (1.0f - cosf(angle));
+            uint8_t duty = static_cast<uint8_t>(intensity * 255.0f + 0.5f);
+            ShiftRegister::writeChannelPwm(pattern.output, duty);
+        }
 
+        TickType_t nowTicks = xTaskGetTickCount();
         if (nowTicks - boardLastToggle >= pdMS_TO_TICKS(500)) {
             boardLevel = !boardLevel;
             digitalWrite(STATUS_LED_PIN, boardLevel ? HIGH : LOW);
             boardLastToggle = nowTicks;
         }
 
-        if (nowTicks - lastModeRefresh >= modeRefreshInterval) {
-            lastModeRefresh = nowTicks;
-            for (size_t i = 0; i < 3; ++i) {
-                states[i].mode = randomMode();
-                states[i].phase = randomPhase();
-                applyInitial(i, nowTicks);
-            }
-        }
-
-        for (size_t i = 0; i < 3; ++i) {
-            LedState &state = states[i];
-            switch (state.mode) {
-            case LedMode::SolidOn:
-                // nothing to do, already set
-                break;
-            case LedMode::SolidOff:
-                break;
-            case LedMode::BlinkSlow:
-                if (nowTicks - state.lastTick >= pdMS_TO_TICKS(700)) {
-                    state.lastTick = nowTicks;
-                    state.level = !state.level;
-                    ShiftRegister::writeChannel(kLedOutputs[i], state.level);
-                }
-                break;
-            case LedMode::BlinkFast:
-                if (nowTicks - state.lastTick >= pdMS_TO_TICKS(200)) {
-                    state.lastTick = nowTicks;
-                    state.level = !state.level;
-                    ShiftRegister::writeChannel(kLedOutputs[i], state.level);
-                }
-                break;
-            case LedMode::BlinkRandom:
-                if (nowTicks - state.lastTick >= state.nextInterval) {
-                    state.lastTick = nowTicks;
-                    state.level = !state.level;
-                    ShiftRegister::writeChannel(kLedOutputs[i], state.level);
-                    state.nextInterval = pdMS_TO_TICKS(100 + (esp_random() % 400));
-                }
-                break;
-            case LedMode::PulseSlow:
-            case LedMode::PulseFast: {
-                float periodMs = (state.mode == LedMode::PulseSlow) ? 4000.0f : 1200.0f;
-                float timeMs = static_cast<float>(nowMs) + state.phase * periodMs;
-                float angle = (timeMs / periodMs) * 6.28318530718f;
-                float intensity = 0.5f * (1.0f - cosf(angle));
-                uint8_t duty = static_cast<uint8_t>(intensity * 255.0f);
-                ShiftRegister::writeChannelPwm(kLedOutputs[i], duty);
-                break;
-            }
-            }
-        }
-
-        vTaskDelay(pollInterval);
+        vTaskDelay(sleepTicks);
     }
 }
 
@@ -739,9 +764,12 @@ void CommTask(void *pvParameters) {
         lastPaired = status.paired;
 
         uint32_t timestampMs = 0;
+        ArmControlCommand armCommand{};
         ThegillCommand directCommand{};
         Comms::ControlPacket packet{};
-        if (Comms::receiveThegillCommand(directCommand, &timestampMs)) {
+        if (Comms::receiveArmCommand(armCommand, &timestampMs)) {
+            applyArmControlCommand(armCommand, timestampMs);
+        } else if (Comms::receiveThegillCommand(directCommand, &timestampMs)) {
             applyThegillCommandPayload(directCommand, timestampMs);
         } else if (Comms::receiveCommand(packet, &timestampMs)) {
             applyControlPacket(packet, timestampMs);
@@ -777,9 +805,15 @@ void OTATask(void *pvParameters) {
     }
 }
 
+// Ensure SR is cleared on system shutdown/reset to avoid stray outputs
+static void SRShutdownHandler() {
+    ShiftRegister::clearAll();
+}
+
 
 void setup()
 {
+    playImmediateStartupTone();
     Serial.begin(115200);
     Serial.println("Thegill S3 controller starting...");
     pinMode(STATUS_LED_PIN, OUTPUT);
@@ -788,6 +822,7 @@ void setup()
         ledcSetup(BUZZER_CHANNEL, 2000, 8);
         ledcAttachPin(BUZZER_PIN, BUZZER_CHANNEL);
         ledcWrite(BUZZER_CHANNEL, 0);
+        runBuzzerSelfTest();
         buzzerQueue = xQueueCreate(5, sizeof(BuzzerCommand));
         CREATE_TASK(
             BuzzerTask,
@@ -814,6 +849,27 @@ void setup()
             digitalWrite(STATUS_LED_PIN, LOW);
             delay(120);
         }
+    }
+
+     if (PeripheralTest::startBreathingTest()) {
+         Serial.println("Peripheral breathing test started at boot");
+     } else {
+         Serial.println("Peripheral breathing test failed to start");
+    }
+
+    
+    // Register shutdown clear
+    esp_register_shutdown_handler(&SRShutdownHandler);
+
+    if (!AnalogInputs::init()) {
+        Serial.println("Analog input subsystem init failed");
+    }
+
+    if (PcintEncoder::initDefault()) {
+        Serial.printf("Wheel encoder subsystem ready (%u channels)\n",
+                      static_cast<unsigned>(PcintEncoder::encoderCount()));
+    } else {
+        Serial.println("Wheel encoder subsystem skipped (no valid PCINT pins)");
     }
 
     ArmControl::init();
@@ -863,7 +919,6 @@ void setup()
     storeCommandSnapshot(initialCommand);
     targetOutputs = {0, 0, 0, 0};
     Motor::update(false, false, currentOutputs, targetOutputs);
-
     // runMotorStartupTest();
 
     Serial.println("System ready for drive!");

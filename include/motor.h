@@ -1,6 +1,7 @@
 #pragma once
 
 #include <Arduino.h>
+#include <cstddef>
 
 namespace Motor {
 struct Outputs {
@@ -17,10 +18,21 @@ struct DriverPins {
     int enablePin;
 };
 
+struct EncoderMeasurement {
+    int32_t totalTicks;
+    float metersTravelled;
+    float metersPerSecond;
+    bool valid;
+};
+
 bool init(const DriverPins &lf, const DriverPins &lr,
           const DriverPins &rf, const DriverPins &rr);
 void calibrate();
 void update(bool enabled, bool brake, Outputs &current, const Outputs &target);
 void stop();
-}
+
+bool encoderMeasurement(std::size_t index, EncoderMeasurement &out);
+std::size_t encoderMeasurements(EncoderMeasurement *out, std::size_t maxCount);
+
+} 
 

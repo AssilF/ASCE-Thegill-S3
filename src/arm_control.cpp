@@ -40,9 +40,13 @@ struct AxisState {
     float effort = 0.0f;
     bool active = false;
     bool filterInitialised = false;
+    int directionSign = 1;
+    uint8_t directionMismatchCount = 0;
 
     AxisState() = default;
-    explicit AxisState(const AxisConfig &cfg) : config(cfg) {}
+    explicit AxisState(const AxisConfig &cfg) : config(cfg) {
+        directionSign = cfg.invertDirection ? -1 : 1;
+    }
 };
 
 constexpr AxisConfig kBaseConfig{
@@ -91,6 +95,28 @@ float clamp01(float value) {
     return clampf(value, 0.0f, 1.0f);
 }
 
+float normalizedFromDegrees(float degrees) {
+    if (config::arm::kBaseMaxDegrees <= 0.0f) {
+        return 0.0f;
+    }
+    return clamp01(degrees / config::arm::kBaseMaxDegrees);
+}
+
+float normalizedFromCentimeters(float centimeters) {
+    if (config::arm::kExtensionMaxCentimeters <= 0.0f) {
+        return 0.0f;
+    }
+    return clamp01(centimeters / config::arm::kExtensionMaxCentimeters);
+}
+
+float degreesFromNormalized(float normalized) {
+    return clamp01(normalized) * config::arm::kBaseMaxDegrees;
+}
+
+float centimetersFromNormalized(float normalized) {
+    return clamp01(normalized) * config::arm::kExtensionMaxCentimeters;
+}
+
 float readAxisSample(AxisState &axis) {
     uint16_t raw = static_cast<uint16_t>(analogRead(axis.config.analogPin));
     axis.lastAdc = raw;
@@ -118,6 +144,7 @@ void configureAnalogPin(uint8_t pin) {
 void idleAxis(AxisState &axis) {
     axis.active = false;
     axis.effort = 0.0f;
+    axis.directionMismatchCount = 0;
     if (!ShiftRegister::initialized()) {
         return;
     }
@@ -132,7 +159,8 @@ void applyAxis(AxisState &axis) {
         return;
     }
 
-    float magnitude = std::fabs(axis.effort);
+    float command = axis.effort * static_cast<float>(axis.directionSign);
+    float magnitude = std::fabs(command);
     bool engaged = gOutputsEnabled && magnitude >= config::arm::kDeadband;
 
     if (!engaged) {
@@ -140,11 +168,7 @@ void applyAxis(AxisState &axis) {
         return;
     }
 
-    bool positive = axis.effort >= 0.0f;
-    if (axis.config.invertDirection) {
-        positive = !positive;
-    }
-
+    bool positive = command >= 0.0f;
     float limited = std::min(magnitude, config::arm::kOutputLimit);
     uint8_t duty = static_cast<uint8_t>(std::round(limited * 255.0f));
     if (duty > 255) {
@@ -162,6 +186,9 @@ void updateAxis(AxisState &axis, float dtSeconds) {
     if (dtSeconds <= 0.0f) {
         return;
     }
+
+    bool hadHistory = axis.filterInitialised;
+    float previousFiltered = axis.filteredPosition;
 
     float sample = readAxisSample(axis);
     axis.rawPosition = sample;
@@ -186,6 +213,34 @@ void updateAxis(AxisState &axis, float dtSeconds) {
                    axis.config.kd * derivative;
 
     axis.effort = clampf(effort, -config::arm::kOutputLimit, config::arm::kOutputLimit);
+
+    float delta = hadHistory ? (axis.filteredPosition - previousFiltered) : 0.0f;
+    float commanded = axis.effort * static_cast<float>(axis.directionSign);
+    bool commandActive = gOutputsEnabled && std::fabs(commanded) >= config::arm::kDeadband;
+
+    if (commandActive && hadHistory) {
+        if (std::fabs(delta) >= config::arm::kDirectionCheckThreshold) {
+            if (delta * commanded < 0.0f) {
+                if (axis.directionMismatchCount < 255) {
+                    axis.directionMismatchCount++;
+                }
+            } else if (axis.directionMismatchCount > 0) {
+                axis.directionMismatchCount--;
+            }
+        } else if (axis.directionMismatchCount > 0) {
+            axis.directionMismatchCount--;
+        }
+
+        if (axis.directionMismatchCount >= config::arm::kDirectionMismatchLimit) {
+            axis.directionMismatchCount = 0;
+            axis.directionSign *= -1;
+            axis.config.invertDirection = !axis.config.invertDirection;
+            axis.integral = 0.0f;
+            axis.lastError = axis.target - axis.filteredPosition;
+        }
+    } else {
+        axis.directionMismatchCount = 0;
+    }
 }
 
 AxisStatus buildAxisStatus(const AxisState &axis) {
@@ -215,10 +270,18 @@ void init() {
     gBase.lastError = 0.0f;
     gExtension.lastError = 0.0f;
 
-    gBase.target = readAxisSample(gBase);
-    gExtension.target = readAxisSample(gExtension);
-    gBase.filteredPosition = gBase.target;
-    gExtension.filteredPosition = gExtension.target;
+    gBase.target = 0.0f;
+    gExtension.target = 0.0f;
+    gBase.filteredPosition = readAxisSample(gBase);
+    gExtension.filteredPosition = readAxisSample(gExtension);
+    gBase.rawPosition = gBase.filteredPosition;
+    gExtension.rawPosition = gExtension.filteredPosition;
+    gBase.lastError = gBase.target - gBase.filteredPosition;
+    gExtension.lastError = gExtension.target - gExtension.filteredPosition;
+    gBase.directionSign = gBase.config.invertDirection ? -1 : 1;
+    gExtension.directionSign = gExtension.config.invertDirection ? -1 : 1;
+    gBase.directionMismatchCount = 0;
+    gExtension.directionMismatchCount = 0;
     gBase.filterInitialised = true;
     gExtension.filterInitialised = true;
 
@@ -297,6 +360,14 @@ void setExtensionTargetNormalized(float value) {
     gExtension.lastError = gExtension.target - gExtension.filteredPosition;
 }
 
+void setBaseTargetDegrees(float degrees) {
+    setBaseTargetNormalized(normalizedFromDegrees(degrees));
+}
+
+void setExtensionTargetCentimeters(float centimeters) {
+    setExtensionTargetNormalized(normalizedFromCentimeters(centimeters));
+}
+
 float baseTargetNormalized() {
     return gBase.target;
 }
@@ -305,12 +376,28 @@ float extensionTargetNormalized() {
     return gExtension.target;
 }
 
+float baseTargetDegrees() {
+    return degreesFromNormalized(gBase.target);
+}
+
+float extensionTargetCentimeters() {
+    return centimetersFromNormalized(gExtension.target);
+}
+
 float basePositionNormalized() {
     return gBase.filteredPosition;
 }
 
 float extensionPositionNormalized() {
     return gExtension.filteredPosition;
+}
+
+float basePositionDegrees() {
+    return degreesFromNormalized(gBase.filteredPosition);
+}
+
+float extensionPositionCentimeters() {
+    return centimetersFromNormalized(gExtension.filteredPosition);
 }
 
 Status status() {
