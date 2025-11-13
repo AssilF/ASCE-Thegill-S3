@@ -11,14 +11,6 @@ namespace {
 
 constexpr size_t MAX_DISCOVERY_ENTRIES = 8;
 
-struct LegacyControlPacket {
-    uint8_t replyIndex;
-    int8_t speed;
-    uint8_t motionState;
-    uint8_t buttonStates[3];
-};
-static_assert(sizeof(LegacyControlPacket) == 6, "Legacy ControlPacket size mismatch");
-
 DeviceRole g_role = DEVICE_ROLE;
 TargetSelector g_targetSelector = nullptr;
 
@@ -31,10 +23,6 @@ size_t g_discoveryCount = 0;
 
 LinkStatus g_linkStatus{};
 
-ControlPacket g_lastCommand{};
-bool g_pendingCommand = false;
-uint32_t g_lastCommandTimestamp = 0;
-
 ThegillCommand g_lastThegillCommand{};
 bool g_pendingThegillCommand = false;
 uint32_t g_lastThegillCommandTimestamp = 0;
@@ -42,6 +30,20 @@ uint32_t g_lastThegillCommandTimestamp = 0;
 ArmControlCommand g_lastArmCommand{};
 bool g_pendingArmCommand = false;
 uint32_t g_lastArmCommandTimestamp = 0;
+
+PeripheralCommand g_lastPeripheralCommand{};
+bool g_pendingPeripheralCommand = false;
+uint32_t g_lastPeripheralCommandTimestamp = 0;
+
+ConfigurationPacket g_lastConfigurationPacket{};
+bool g_pendingConfigurationPacket = false;
+uint32_t g_lastConfigurationPacketTimestamp = 0;
+
+SettingsPacket g_lastSettingsPacket{};
+bool g_pendingSettingsPacket = false;
+uint32_t g_lastSettingsPacketTimestamp = 0;
+
+uint32_t g_lastPeerHeartbeatTimestamp = 0;
 
 bool g_initialized = false;
 uint32_t g_lastBroadcastMs = 0;
@@ -144,12 +146,17 @@ void clearLinkStatus() {
         }
     }
     g_linkStatus = LinkStatus{};
-    g_pendingCommand = false;
     g_pendingThegillCommand = false;
     g_pendingArmCommand = false;
-    g_lastCommandTimestamp = 0;
+    g_pendingPeripheralCommand = false;
+    g_pendingConfigurationPacket = false;
+    g_pendingSettingsPacket = false;
     g_lastThegillCommandTimestamp = 0;
     g_lastArmCommandTimestamp = 0;
+    g_lastPeripheralCommandTimestamp = 0;
+    g_lastConfigurationPacketTimestamp = 0;
+    g_lastSettingsPacketTimestamp = 0;
+    g_lastPeerHeartbeatTimestamp = 0;
 }
 
 void handlePairAck(uint32_t nowMs, const uint8_t mac[6], const Packet &packet) {
@@ -163,7 +170,7 @@ void handlePairAck(uint32_t nowMs, const uint8_t mac[6], const Packet &packet) {
     std::memcpy(g_linkStatus.peerMac, g_pendingMac, 6);
     g_linkStatus.lastActivityMs = nowMs;
     g_linkStatus.lastCommandMs = 0;
-    g_pendingCommand = false;
+    g_lastPeerHeartbeatTimestamp = nowMs;
     ensurePeer(mac);
 }
 
@@ -181,7 +188,7 @@ void handlePairConfirm(uint32_t nowMs, const uint8_t mac[6], const Packet &packe
     std::memcpy(g_linkStatus.peerMac, mac, 6);
     g_linkStatus.lastActivityMs = nowMs;
     g_linkStatus.lastCommandMs = 0;
-    g_pendingCommand = false;
+    g_lastPeerHeartbeatTimestamp = nowMs;
 
     ensurePeer(mac);
     sendPacket(mac, MessageType::MSG_PAIR_ACK);
@@ -251,17 +258,100 @@ void onDataRecv(const uint8_t *mac, const uint8_t *incomingData, int len) {
         }
 
         g_linkStatus.lastActivityMs = nowMs;
-    } else if (len == static_cast<int>(sizeof(ControlPacket)) ||
-               len == static_cast<int>(sizeof(LegacyControlPacket))) {
         if (g_linkStatus.paired && macEqualBytes(mac, g_linkStatus.peerMac)) {
-            ControlPacket decoded{};
-            const size_t copyLen = static_cast<size_t>(len);
-            std::memcpy(&decoded, incomingData, copyLen);
-            g_lastCommand = decoded;
-            g_pendingCommand = true;
-            g_lastCommandTimestamp = nowMs;
-            g_linkStatus.lastCommandMs = nowMs;
-            g_linkStatus.lastActivityMs = nowMs;
+            g_lastPeerHeartbeatTimestamp = nowMs;
+        }
+    } else if (len == static_cast<int>(sizeof(PeripheralCommand))) {
+        const uint32_t magic = *reinterpret_cast<const uint32_t *>(incomingData);
+        if (magic == THEGILL_PERIPHERAL_MAGIC) {
+            const PeripheralCommand *packet = reinterpret_cast<const PeripheralCommand *>(incomingData);
+            bool fromBroadcast = macEqualBytes(mac, BroadcastMac);
+            bool fromPeer = g_linkStatus.paired && macEqualBytes(mac, g_linkStatus.peerMac);
+
+            if (!g_linkStatus.paired && !fromBroadcast) {
+                g_linkStatus.paired = true;
+                g_linkStatus.peerIdentity = Identity{};
+                std::memcpy(g_linkStatus.peerIdentity.mac, mac, 6);
+                std::memcpy(g_linkStatus.peerMac, mac, 6);
+                g_pendingThegillCommand = false;
+                g_pendingArmCommand = false;
+                g_pendingPeripheralCommand = false;
+                g_pendingConfigurationPacket = false;
+                g_pendingSettingsPacket = false;
+                ensurePeer(mac);
+                fromPeer = true;
+            }
+
+            if (fromPeer || (fromBroadcast && g_linkStatus.paired)) {
+                g_lastPeripheralCommand = *packet;
+                g_pendingPeripheralCommand = true;
+                g_lastPeripheralCommandTimestamp = nowMs;
+                g_linkStatus.lastCommandMs = nowMs;
+                g_linkStatus.lastActivityMs = nowMs;
+                if (fromPeer) {
+                    g_lastPeerHeartbeatTimestamp = nowMs;
+                }
+            }
+        } else if (magic == THEGILL_CONFIG_MAGIC) {
+            const ConfigurationPacket *packet = reinterpret_cast<const ConfigurationPacket *>(incomingData);
+            bool fromBroadcast = macEqualBytes(mac, BroadcastMac);
+            bool fromPeer = g_linkStatus.paired && macEqualBytes(mac, g_linkStatus.peerMac);
+
+            if (!g_linkStatus.paired && !fromBroadcast) {
+                g_linkStatus.paired = true;
+                g_linkStatus.peerIdentity = Identity{};
+                std::memcpy(g_linkStatus.peerIdentity.mac, mac, 6);
+                std::memcpy(g_linkStatus.peerMac, mac, 6);
+                g_pendingThegillCommand = false;
+                g_pendingArmCommand = false;
+                g_pendingPeripheralCommand = false;
+                g_pendingConfigurationPacket = false;
+                g_pendingSettingsPacket = false;
+                ensurePeer(mac);
+                fromPeer = true;
+            }
+
+            if (fromPeer || (fromBroadcast && g_linkStatus.paired)) {
+                g_lastConfigurationPacket = *packet;
+                g_pendingConfigurationPacket = true;
+                g_lastConfigurationPacketTimestamp = nowMs;
+                g_linkStatus.lastCommandMs = nowMs;
+                g_linkStatus.lastActivityMs = nowMs;
+                if (fromPeer) {
+                    g_lastPeerHeartbeatTimestamp = nowMs;
+                }
+            }
+        }
+    } else if (len >= static_cast<int>(sizeof(SettingsPacket))) {
+        const SettingsPacket *packet = reinterpret_cast<const SettingsPacket *>(incomingData);
+        if (packet->magic == THEGILL_SETTINGS_MAGIC) {
+            bool fromBroadcast = macEqualBytes(mac, BroadcastMac);
+            bool fromPeer = g_linkStatus.paired && macEqualBytes(mac, g_linkStatus.peerMac);
+
+            if (!g_linkStatus.paired && !fromBroadcast) {
+                g_linkStatus.paired = true;
+                g_linkStatus.peerIdentity = Identity{};
+                std::memcpy(g_linkStatus.peerIdentity.mac, mac, 6);
+                std::memcpy(g_linkStatus.peerMac, mac, 6);
+                g_pendingThegillCommand = false;
+                g_pendingArmCommand = false;
+                g_pendingPeripheralCommand = false;
+                g_pendingConfigurationPacket = false;
+                g_pendingSettingsPacket = false;
+                ensurePeer(mac);
+                fromPeer = true;
+            }
+
+            if (fromPeer || (fromBroadcast && g_linkStatus.paired)) {
+                g_lastSettingsPacket = *packet;
+                g_pendingSettingsPacket = true;
+                g_lastSettingsPacketTimestamp = nowMs;
+                g_linkStatus.lastCommandMs = nowMs;
+                g_linkStatus.lastActivityMs = nowMs;
+                if (fromPeer) {
+                    g_lastPeerHeartbeatTimestamp = nowMs;
+                }
+            }
         }
     } else if (len >= static_cast<int>(sizeof(ArmControlCommand))) {
         const ArmControlCommand *packet = reinterpret_cast<const ArmControlCommand *>(incomingData);
@@ -274,9 +364,11 @@ void onDataRecv(const uint8_t *mac, const uint8_t *incomingData, int len) {
                 g_linkStatus.peerIdentity = Identity{};
                 std::memcpy(g_linkStatus.peerIdentity.mac, mac, 6);
                 std::memcpy(g_linkStatus.peerMac, mac, 6);
-                g_pendingCommand = false;
                 g_pendingThegillCommand = false;
                 g_pendingArmCommand = false;
+                g_pendingPeripheralCommand = false;
+                g_pendingConfigurationPacket = false;
+                g_pendingSettingsPacket = false;
                 ensurePeer(mac);
                 fromPeer = true;
             }
@@ -285,9 +377,11 @@ void onDataRecv(const uint8_t *mac, const uint8_t *incomingData, int len) {
                 g_lastArmCommand = *packet;
                 g_pendingArmCommand = true;
                 g_lastArmCommandTimestamp = nowMs;
-                g_lastCommandTimestamp = nowMs;
                 g_linkStatus.lastCommandMs = nowMs;
                 g_linkStatus.lastActivityMs = nowMs;
+                if (fromPeer) {
+                    g_lastPeerHeartbeatTimestamp = nowMs;
+                }
             }
         }
     } else if (len >= static_cast<int>(sizeof(ThegillCommand))) {
@@ -301,8 +395,10 @@ void onDataRecv(const uint8_t *mac, const uint8_t *incomingData, int len) {
                 g_linkStatus.peerIdentity = Identity{};
                 std::memcpy(g_linkStatus.peerIdentity.mac, mac, 6);
                 std::memcpy(g_linkStatus.peerMac, mac, 6);
-                g_pendingCommand = false;
                 g_pendingArmCommand = false;
+                g_pendingPeripheralCommand = false;
+                g_pendingConfigurationPacket = false;
+                g_pendingSettingsPacket = false;
                 ensurePeer(mac);
                 fromPeer = true;
             }
@@ -311,9 +407,11 @@ void onDataRecv(const uint8_t *mac, const uint8_t *incomingData, int len) {
                 g_lastThegillCommand = *packet;
                 g_pendingThegillCommand = true;
                 g_lastThegillCommandTimestamp = nowMs;
-                g_lastCommandTimestamp = nowMs;
                 g_linkStatus.lastCommandMs = nowMs;
                 g_linkStatus.lastActivityMs = nowMs;
+                if (fromPeer) {
+                    g_lastPeerHeartbeatTimestamp = nowMs;
+                }
             }
         }
     }
@@ -463,19 +561,6 @@ void loop() {
     pruneDiscoveries(nowMs);
 }
 
-bool receiveCommand(ControlPacket &cmd, uint32_t *timestampMs) {
-    if (!g_pendingCommand) {
-        return false;
-    }
-
-    cmd = g_lastCommand;
-    if (timestampMs) {
-        *timestampMs = g_lastCommandTimestamp;
-    }
-    g_pendingCommand = false;
-    return true;
-}
-
 bool receiveArmCommand(ArmControlCommand &cmd, uint32_t *timestampMs) {
     if (!g_pendingArmCommand) {
         return false;
@@ -502,9 +587,48 @@ bool receiveThegillCommand(ThegillCommand &cmd, uint32_t *timestampMs) {
     return true;
 }
 
+bool receivePeripheralCommand(PeripheralCommand &cmd, uint32_t *timestampMs) {
+    if (!g_pendingPeripheralCommand) {
+        return false;
+    }
+
+    cmd = g_lastPeripheralCommand;
+    if (timestampMs) {
+        *timestampMs = g_lastPeripheralCommandTimestamp;
+    }
+    g_pendingPeripheralCommand = false;
+    return true;
+}
+
+bool receiveConfigurationPacket(ConfigurationPacket &cmd, uint32_t *timestampMs) {
+    if (!g_pendingConfigurationPacket) {
+        return false;
+    }
+
+    cmd = g_lastConfigurationPacket;
+    if (timestampMs) {
+        *timestampMs = g_lastConfigurationPacketTimestamp;
+    }
+    g_pendingConfigurationPacket = false;
+    return true;
+}
+
+bool receiveSettingsPacket(SettingsPacket &cmd, uint32_t *timestampMs) {
+    if (!g_pendingSettingsPacket) {
+        return false;
+    }
+
+    cmd = g_lastSettingsPacket;
+    if (timestampMs) {
+        *timestampMs = g_lastSettingsPacketTimestamp;
+    }
+    g_pendingSettingsPacket = false;
+    return true;
+}
+
 uint32_t lastCommandTimestamp() {
-    uint32_t latest = std::max(g_lastCommandTimestamp, g_lastThegillCommandTimestamp);
-    latest = std::max(latest, g_lastArmCommandTimestamp);
+    uint32_t latest = std::max(g_lastThegillCommandTimestamp, g_lastArmCommandTimestamp);
+    latest = std::max(latest, g_lastPeripheralCommandTimestamp);
     return latest;
 }
 
@@ -516,12 +640,50 @@ uint32_t lastArmCommandTimestamp() {
     return g_lastArmCommandTimestamp;
 }
 
+uint32_t lastConfigurationCommandTimestamp() {
+    return g_lastConfigurationPacketTimestamp;
+}
+
+uint32_t lastSettingsCommandTimestamp() {
+    return g_lastSettingsPacketTimestamp;
+}
+
+uint32_t lastPeerHeartbeatTimestamp() {
+    return g_lastPeerHeartbeatTimestamp;
+}
+
 LinkStatus getLinkStatus() {
     return g_linkStatus;
 }
 
 bool paired() {
     return g_linkStatus.paired;
+}
+
+bool sendStatusPacket(const StatusPacket &packet) {
+    if (!g_initialized || !g_linkStatus.paired) {
+        return false;
+    }
+    if (macEqualBytes(g_linkStatus.peerMac, BroadcastMac)) {
+        return false;
+    }
+    esp_err_t result = esp_now_send(g_linkStatus.peerMac,
+                                    reinterpret_cast<const uint8_t *>(&packet),
+                                    sizeof(packet));
+    return result == ESP_OK;
+}
+
+bool sendArmStatePacket(const ArmStatePacket &packet) {
+    if (!g_initialized || !g_linkStatus.paired) {
+        return false;
+    }
+    if (macEqualBytes(g_linkStatus.peerMac, BroadcastMac)) {
+        return false;
+    }
+    esp_err_t result = esp_now_send(g_linkStatus.peerMac,
+                                    reinterpret_cast<const uint8_t *>(&packet),
+                                    sizeof(packet));
+    return result == ESP_OK;
 }
 
 } // namespace Comms

@@ -12,6 +12,7 @@
 #include <cstring>
 #include <cstdlib>
 #include <cmath>
+#include <algorithm>
 #include "analog_inputs.h"
 #include "comms.h"
 #include "commands.h"
@@ -22,7 +23,6 @@
 #include "pcint_encoder.h"
 #include "arm_control.h"
 #include "arm_servos.h"
-#include "peripheral_test.h"
 
 // ==================== BOARD CONFIGURATION ====================
 // ESP32-S3 pin mappings for BTS7960 bridge drivers and task sizes
@@ -53,22 +53,53 @@ constexpr auto SR_STATUS_LED_PRIMARY = ShiftRegister::Output::SystemIndicatorLed
 constexpr auto SR_STATUS_LED_SECONDARY = ShiftRegister::Output::GripperIndicatorLed;
 constexpr auto SR_STATUS_LED_DEBUG = ShiftRegister::Output::ArmIndicatorLed;
 
+constexpr ShiftRegister::Output kHighPowerLedOutputs[3] = {
+    ShiftRegister::Output::HighPowerLed1,
+    ShiftRegister::Output::HighPowerLed2,
+    ShiftRegister::Output::HighPowerLed3,
+};
+
+struct PeripheralState {
+    uint8_t ledPwm[3] = {0, 0, 0};
+    uint8_t pumpDuty = 0;
+    uint8_t userMask = 0;
+};
+
+static PeripheralState gPeripheralState{};
+
+static void publishStatus();
+static void applyConfigurationPacket(const ConfigurationPacket &packet);
+static void applySettingsPacket(const SettingsPacket &packet);
+static void sendArmStateSnapshot();
+static Motor::Outputs filterDriveCommand(const Motor::Outputs &target, float dtSeconds, bool allowEasing);
+static void resetDriveEasing(const Motor::Outputs &value);
+static void updateBatterySafety(uint16_t batteryMillivolts);
+static void reconfigureSoftAp(const char *ssid, const char *password);
+
 
 /// ==================== CONSTANTS ====================
-const char *WIFI_SSID = "Thegill Telemetry";
-const char *WIFI_PASSWORD = "ASCEpec@2025";
+char WIFI_SSID[33] = "Thegill Telemetry";
+char WIFI_PASSWORD[65] = "ASCEpec@2025";
 const int TCP_PORT = 8000;
 
 // Motor and control constants
 const int16_t MOTOR_MIN = -1000;
 const int16_t MOTOR_MAX = 1000;
-const unsigned long FAILSAFE_TIMEOUT = 500;  // ms
+const unsigned long HEARTBEAT_TIMEOUT_MS = 2000;  // ms without controller traffic
 const unsigned long TELEMETRY_INTERVAL = 50; // ms
 bool failsafe_enable = false;
 bool isArmed = true;
+static DriveEasingMode g_driveEasingMode = DriveEasingMode::None;
+static uint8_t g_driveEasingRate = 0;
+static Motor::Outputs g_easedOutputs{0, 0, 0, 0};
+static bool g_batterySafetyEnabled = false;
+static bool g_batteryProtectionLatched = false;
+static uint16_t g_batteryCutoffMv = 15000;
+static uint16_t g_batteryRecoverMv = 15500;
+static uint16_t g_lastBatteryMillivolts = 0;
 
-const char *DRONE_ID = "Thegill";
-const uint32_t PACKET_MAGIC = THEGILL_PACKET_MAGIC;
+char DRONE_ID[33] = "Thegill";
+char ROBOT_NAME[32] = "ThegillS3";
 
 struct BuzzerCommand {
     uint16_t durationMs;
@@ -80,13 +111,14 @@ struct BuzzerCommand {
 // Hardware
 WiFiServer server(TCP_PORT);
 WiFiClient client;
-ThegillCommand command = {THEGILL_PACKET_MAGIC, 0, 0, 0, 0, 4.0f, GillMode::Default, GillEasing::EaseInOut, 0, 0};
+ThegillCommand command = {THEGILL_PACKET_MAGIC, 0, 0, 0, 0, 0, 0};
 portMUX_TYPE commandMux = portMUX_INITIALIZER_UNLOCKED;
 Motor::Outputs currentOutputs{0, 0, 0, 0};
 Motor::Outputs targetOutputs{0, 0, 0, 0};
 ThegillTelemetry gillTelemetry{};
 unsigned long lastTelemetry = 0;
 QueueHandle_t buzzerQueue = nullptr;
+bool buzzerMuted = false;
 
 // ==================== COMMUNICATION FUNCTIONS ====================
 bool telemetryEnabled = false; // Serial/TCP telemetry disabled by default
@@ -122,62 +154,343 @@ static inline void storeCommandSnapshotFromISR(const ThegillCommand &value)
 
 static inline Motor::Outputs commandToMotorOutputs(const ThegillCommand &cmd)
 {
-    // The ELITE/ILITE control payload orders motors as front-left, front-right,
-    // rear-left, rear-right.  Our Motor::Outputs structure expects them in
-    // left-front, left-rear, right-front, right-rear order.  Re-map the values
-    // here so every caller can work with physical motor positions.
     Motor::Outputs outputs{};
     outputs.leftFront = static_cast<int16_t>(constrain(cmd.leftFront, MOTOR_MIN, MOTOR_MAX));
-    outputs.leftRear = static_cast<int16_t>(constrain(cmd.rightFront, MOTOR_MIN, MOTOR_MAX));
-    outputs.rightFront = static_cast<int16_t>(constrain(cmd.leftRear, MOTOR_MIN, MOTOR_MAX));
+    outputs.leftRear = static_cast<int16_t>(constrain(cmd.leftRear, MOTOR_MIN, MOTOR_MAX));
+    outputs.rightFront = static_cast<int16_t>(constrain(cmd.rightFront, MOTOR_MIN, MOTOR_MAX));
     outputs.rightRear = static_cast<int16_t>(constrain(cmd.rightRear, MOTOR_MIN, MOTOR_MAX));
     return outputs;
 }
 
-static int16_t decodeMotionBits(uint8_t encoded, int16_t magnitude, bool &brakeRequested)
+static inline bool copyBoundedString(char *dest, size_t destSize, const char *src, size_t srcSize)
 {
-    switch (encoded & 0x03)
+    if (!dest || destSize == 0)
     {
-    case 0x00:
-        return 0;
-    case 0x01:
-        return -magnitude;
-    case 0x02:
-        return magnitude;
-    case 0x03:
-    default:
-        brakeRequested = true;
-        return 0;
+        return false;
+    }
+    if (!src || srcSize == 0)
+    {
+        return false;
+    }
+    size_t copyLen = 0;
+    while (copyLen < srcSize && src[copyLen] != '\0')
+    {
+        ++copyLen;
+    }
+    if (copyLen == 0)
+    {
+        return false;
+    }
+    if (copyLen >= destSize)
+    {
+        copyLen = destSize - 1;
+    }
+    std::memcpy(dest, src, copyLen);
+    dest[copyLen] = '\0';
+    return true;
+}
+
+static void resetDriveEasing(const Motor::Outputs &value)
+{
+    g_easedOutputs = value;
+}
+
+static Motor::Outputs filterDriveCommand(const Motor::Outputs &target, float dtSeconds, bool allowEasing)
+{
+    if (!allowEasing || g_driveEasingMode == DriveEasingMode::None || g_driveEasingRate == 0)
+    {
+        resetDriveEasing(target);
+        return target;
+    }
+
+    Motor::Outputs eased = g_easedOutputs;
+    switch (g_driveEasingMode)
+    {
+        case DriveEasingMode::SlewRate:
+        {
+            const float countsPerSecond = static_cast<float>(g_driveEasingRate) * 50.0f;
+            float maxStep = countsPerSecond * dtSeconds;
+            if (maxStep < 1.0f)
+            {
+                maxStep = 1.0f;
+            }
+            auto applyChannel = [&](int16_t &current, int16_t desired) {
+                float delta = static_cast<float>(desired - current);
+                if (delta > maxStep)
+                {
+                    delta = maxStep;
+                }
+                else if (delta < -maxStep)
+                {
+                    delta = -maxStep;
+                }
+                current = static_cast<int16_t>(roundf(static_cast<float>(current) + delta));
+            };
+            applyChannel(eased.leftFront, target.leftFront);
+            applyChannel(eased.leftRear, target.leftRear);
+            applyChannel(eased.rightFront, target.rightFront);
+            applyChannel(eased.rightRear, target.rightRear);
+            break;
+        }
+        case DriveEasingMode::Exponential:
+        {
+            float alpha = static_cast<float>(g_driveEasingRate) / 255.0f;
+            alpha = constrain(alpha, 0.0f, 1.0f);
+            if (alpha <= 0.0f)
+            {
+                resetDriveEasing(target);
+                return target;
+            }
+            auto blendChannel = [&](int16_t &current, int16_t desired) {
+                float blended = alpha * static_cast<float>(desired) + (1.0f - alpha) * static_cast<float>(current);
+                current = static_cast<int16_t>(roundf(blended));
+            };
+            blendChannel(eased.leftFront, target.leftFront);
+            blendChannel(eased.leftRear, target.leftRear);
+            blendChannel(eased.rightFront, target.rightFront);
+            blendChannel(eased.rightRear, target.rightRear);
+            break;
+        }
+        default:
+            eased = target;
+            break;
+    }
+
+    g_easedOutputs = eased;
+    return eased;
+}
+
+static void reconfigureSoftAp(const char *ssid, const char *password)
+{
+    if (!ssid || !password)
+    {
+        return;
+    }
+    WiFi.softAP(ssid, password);
+}
+
+static void sendArmStateSnapshot()
+{
+    if (!Comms::paired())
+    {
+        return;
+    }
+
+    ArmStatePacket packet{};
+    packet.magic = THEGILL_ARM_STATE_MAGIC;
+    packet.baseDegrees = ArmControl::basePositionDegrees();
+    packet.extensionCentimeters = ArmControl::extensionPositionCentimeters();
+
+    uint8_t enabledMask = 0;
+    uint8_t attachedMask = 0;
+    for (size_t idx = 0; idx < THEGILL_ARM_SERVO_COUNT; ++idx)
+    {
+        ArmServos::ServoId id = static_cast<ArmServos::ServoId>(idx);
+        ArmServos::ServoStatus status = ArmServos::status(id);
+        packet.servoDegrees[idx] = status.targetDegrees;
+        if (status.enabled)
+        {
+            enabledMask |= static_cast<uint8_t>(1u << idx);
+        }
+        if (status.attached)
+        {
+            attachedMask |= static_cast<uint8_t>(1u << idx);
+        }
+    }
+    packet.servoEnabledMask = enabledMask;
+    packet.servoAttachedMask = attachedMask;
+    packet.flags = 0;
+    if (ArmControl::outputsEnabled())
+    {
+        packet.flags |= 0x01;
+    }
+    if (ArmServos::enabled())
+    {
+        packet.flags |= 0x02;
+    }
+
+    Comms::sendArmStatePacket(packet);
+}
+
+static void applySettingsPacket(const SettingsPacket &packet)
+{
+    if (copyBoundedString(ROBOT_NAME, sizeof(ROBOT_NAME), packet.robotName, sizeof(packet.robotName)))
+    {
+        Comms::setPlatform(ROBOT_NAME);
+    }
+    if (copyBoundedString(DRONE_ID, sizeof(DRONE_ID), packet.customId, sizeof(packet.customId)))
+    {
+        Comms::setCustomId(DRONE_ID);
+    }
+    bool updatedSsid = copyBoundedString(WIFI_SSID, sizeof(WIFI_SSID), packet.wifiSsid, sizeof(packet.wifiSsid));
+    bool updatedPassword = copyBoundedString(WIFI_PASSWORD, sizeof(WIFI_PASSWORD), packet.wifiPassword, sizeof(packet.wifiPassword));
+    if (updatedSsid || updatedPassword)
+    {
+        reconfigureSoftAp(WIFI_SSID, WIFI_PASSWORD);
     }
 }
 
-// Apply LED, pump, and auxiliary user-output values from the control stream.
-static void applyPeripheralOutputs(const Comms::ControlPacket &packet)
+static void updateBatterySafety(uint16_t batteryMillivolts)
+{
+    g_lastBatteryMillivolts = batteryMillivolts;
+    if (!g_batterySafetyEnabled)
+    {
+        g_batteryProtectionLatched = false;
+        return;
+    }
+
+    if (!g_batteryProtectionLatched && batteryMillivolts > 0 && batteryMillivolts <= g_batteryCutoffMv)
+    {
+        g_batteryProtectionLatched = true;
+        isArmed = false;
+
+        ThegillCommand safe = loadCommandSnapshot();
+        safe.leftFront = safe.leftRear = safe.rightFront = safe.rightRear = 0;
+        safe.flags |= GILL_FLAG_BRAKE;
+        storeCommandSnapshot(safe);
+
+        Motor::Outputs outputs = commandToMotorOutputs(safe);
+        targetOutputs = outputs;
+        resetDriveEasing(outputs);
+        Motor::update(false, true, currentOutputs, targetOutputs);
+
+        ArmControl::setOutputsEnabled(false);
+        ArmServos::setEnabled(false);
+    }
+    else if (g_batteryProtectionLatched && batteryMillivolts >= g_batteryRecoverMv)
+    {
+        g_batteryProtectionLatched = false;
+        ArmControl::setOutputsEnabled(armControlEnabled);
+        ArmServos::setEnabled(armControlEnabled);
+    }
+}
+
+static void applyConfigurationPacket(const ConfigurationPacket &packet)
+{
+    DriveEasingMode mode = DriveEasingMode::None;
+    if (packet.easingMode <= static_cast<uint8_t>(DriveEasingMode::Exponential))
+    {
+        mode = static_cast<DriveEasingMode>(packet.easingMode);
+    }
+    g_driveEasingMode = mode;
+    g_driveEasingRate = packet.easingRate;
+    Motor::Outputs snapshotOutputs = commandToMotorOutputs(loadCommandSnapshot());
+    resetDriveEasing(snapshotOutputs);
+
+    bool mute = (packet.controlFlags & ConfigFlag::MuteAudio) != 0;
+    buzzerMuted = mute;
+
+    bool driveEnabled = (packet.controlFlags & ConfigFlag::DriveEnabled) != 0;
+    if (isArmed != driveEnabled)
+    {
+        isArmed = driveEnabled;
+        if (!driveEnabled)
+        {
+            ThegillCommand safe = loadCommandSnapshot();
+            safe.leftFront = safe.leftRear = safe.rightFront = safe.rightRear = 0;
+            safe.flags |= GILL_FLAG_BRAKE;
+            storeCommandSnapshot(safe);
+
+            Motor::Outputs outputs = commandToMotorOutputs(safe);
+            targetOutputs = outputs;
+            resetDriveEasing(outputs);
+            Motor::update(false, true, currentOutputs, targetOutputs);
+        }
+    }
+    if (g_batteryProtectionLatched)
+    {
+        isArmed = false;
+    }
+
+    bool manipEnabled = (packet.controlFlags & ConfigFlag::ArmOutputsEnable) != 0;
+    if (armControlEnabled != manipEnabled)
+    {
+        armControlEnabled = manipEnabled;
+        ArmControl::setOutputsEnabled(armControlEnabled);
+        ArmServos::setEnabled(armControlEnabled);
+    }
+
+    failsafe_enable = (packet.controlFlags & ConfigFlag::FailsafeEnable) != 0;
+
+    g_batterySafetyEnabled = (packet.safetyFlags & SafetyFlag::BatterySafetyEnable) != 0;
+    if (packet.batteryCutoffMillivolts != 0)
+    {
+        g_batteryCutoffMv = packet.batteryCutoffMillivolts;
+    }
+    if (packet.batteryRecoverMillivolts != 0)
+    {
+        g_batteryRecoverMv = packet.batteryRecoverMillivolts;
+    }
+    if (g_batteryRecoverMv <= g_batteryCutoffMv)
+    {
+        g_batteryRecoverMv = g_batteryCutoffMv + 200;
+    }
+    if (!g_batterySafetyEnabled)
+    {
+        g_batteryProtectionLatched = false;
+    }
+}
+
+static void syncPeripheralOutputs()
 {
     if (!ShiftRegister::initialized())
     {
         return;
     }
 
-    constexpr ShiftRegister::Output kHighPowerLeds[3] = {
-        ShiftRegister::Output::HighPowerLed1,
-        ShiftRegister::Output::HighPowerLed2,
-        ShiftRegister::Output::HighPowerLed3,
-    };
-
-    bool overrideOutputs = PeripheralTest::overridesPeripheralOutputs();
-
-    if (!overrideOutputs)
+    for (uint8_t i = 0; i < 3; ++i)
     {
-        for (uint8_t i = 0; i < 3; ++i)
-        {
-            ShiftRegister::writeChannelPwm(kHighPowerLeds[i], packet.ledPwm[i]);
-        }
-
-        ShiftRegister::writeChannelPwm(ShiftRegister::Output::PumpControl, packet.pumpIntensity);
+        ShiftRegister::writeChannelPwm(kHighPowerLedOutputs[i], gPeripheralState.ledPwm[i]);
     }
 
-    ShiftRegister::writeUserMask(packet.commandByte);
+    ShiftRegister::writeChannelPwm(ShiftRegister::Output::PumpControl, gPeripheralState.pumpDuty);
+    ShiftRegister::writeUserMask(gPeripheralState.userMask);
+}
+
+static void applyPeripheralCommand(const Comms::PeripheralCommand &packet)
+{
+    for (uint8_t i = 0; i < 3; ++i)
+    {
+        gPeripheralState.ledPwm[i] = packet.ledPwm[i];
+    }
+    gPeripheralState.pumpDuty = packet.pumpDuty;
+    gPeripheralState.userMask = packet.userMask;
+    syncPeripheralOutputs();
+}
+
+static void clearPeripheralState()
+{
+    gPeripheralState = PeripheralState{};
+    syncPeripheralOutputs();
+}
+
+static void handleSystemCommandBits(uint8_t bits)
+{
+    if (bits & GillSystemCommand::EnableTelemetry)
+    {
+        telemetryEnabled = true;
+    }
+    if (bits & GillSystemCommand::DisableTelemetry)
+    {
+        telemetryEnabled = false;
+    }
+    if (bits & GillSystemCommand::EnableBuzzer)
+    {
+        buzzerMuted = false;
+    }
+    if (bits & GillSystemCommand::DisableBuzzer)
+    {
+        buzzerMuted = true;
+    }
+    if (bits & GillSystemCommand::RequestStatus)
+    {
+        lastTelemetry = 0;
+        publishStatus();
+    }
+    if (bits & GillSystemCommand::RequestArmState)
+    {
+        sendArmStateSnapshot();
+    }
 }
 
 static void applyArmControlCommand(const ArmControlCommand &packet, uint32_t timestampMs)
@@ -237,45 +550,17 @@ static void applyArmControlCommand(const ArmControlCommand &packet, uint32_t tim
     armControlEnabled = ArmControl::outputsEnabled();
 }
 
-static void applyControlPacket(const Comms::ControlPacket &packet, uint32_t timestampMs)
-{
-    (void)timestampMs;
-    ThegillCommand updated = loadCommandSnapshot();
-    updated.magic = THEGILL_PACKET_MAGIC;
-
-    const int16_t magnitude = static_cast<int16_t>(constrain(static_cast<int32_t>(abs(packet.speed)) * 10, 0L, static_cast<long>(MOTOR_MAX)));
-    bool brakeRequested = false;
-
-    auto decode = [&](uint8_t shift) {
-        return decodeMotionBits((packet.motionState >> shift) & 0x03, magnitude, brakeRequested);
-    };
-
-    updated.leftFront = decode(6);
-    updated.leftRear = decode(4);
-    updated.rightFront = decode(2);
-    updated.rightRear = decode(0);
-
-    uint8_t flags = 0;
-    if (brakeRequested || (packet.buttonStates[0] & 0x01))
-    {
-        flags |= GILL_FLAG_BRAKE;
-    }
-    if (packet.buttonStates[0] & 0x02)
-    {
-        flags |= GILL_FLAG_HONK;
-    }
-    updated.flags = flags;
-
-    storeCommandSnapshot(updated);
-    applyPeripheralOutputs(packet);
-}
-
 static void applyThegillCommandPayload(const ThegillCommand &packet, uint32_t timestampMs)
 {
     (void)timestampMs;
     if (packet.magic != THEGILL_PACKET_MAGIC)
     {
         return;
+    }
+
+    if (packet.system != 0)
+    {
+        handleSystemCommandBits(packet.system);
     }
 
     ThegillCommand updated = packet;
@@ -323,7 +608,7 @@ static void handleBufferedCharacter(char c)
 
 static void enqueueChord(const uint16_t *freqs, size_t count, uint16_t durationMs)
 {
-    if (BUZZER_PIN < 0 || !buzzerQueue || !freqs || count == 0)
+    if (BUZZER_PIN < 0 || !buzzerQueue || !freqs || count == 0 || buzzerMuted)
         return;
 
     BuzzerCommand cmd{};
@@ -386,7 +671,7 @@ void BuzzerTask(void *pvParameters)
 
 static void runBuzzerSelfTest()
 {
-    if (BUZZER_PIN < 0)
+    if (BUZZER_PIN < 0 || buzzerMuted)
     {
         return;
     }
@@ -448,81 +733,121 @@ static void runMotorStartupTest()
 
     targetOutputs = {0, 0, 0, 0};
     Motor::update(false, false, currentOutputs, targetOutputs);
+    resetDriveEasing(targetOutputs);
     Serial.println("Motor startup self-test complete.");
 }
 
-#pragma pack(push, 1)
-struct GillTelemetryPacket {
-    uint32_t magic;
-    float pitch;
-    float roll;
-    float yaw;
-    float pitchCorrection;
-    float rollCorrection;
-    float yawCorrection;
-    uint16_t throttle;
-    int8_t pitchCommand;
-    int8_t rollCommand;
-    int8_t yawCommand;
-    float altitude;
-    float verticalAcc;
-    uint32_t commandAge;
-};
-#pragma pack(pop)
-
-void streamTelemetry()
+void publishStatus()
 {
     if (millis() - lastTelemetry < TELEMETRY_INTERVAL)
         return;
 
     lastTelemetry = millis();
 
-    ThegillCommand currentCommand = loadCommandSnapshot();
     uint32_t nowMs = millis();
     uint32_t lastCommandMs = Comms::lastCommandTimestamp();
     uint32_t commandAge = (lastCommandMs != 0 && nowMs >= lastCommandMs) ? (nowMs - lastCommandMs) : 0;
 
-    int32_t throttleValue = currentOutputs.rightRear + 1000;
-    if (throttleValue < 0)
+    Comms::StatusPacket packet{};
+    packet.magic = Comms::THEGILL_STATUS_MAGIC;
+
+    constexpr size_t kWheelCount = sizeof(packet.wheelSpeedMmPerSec) / sizeof(packet.wheelSpeedMmPerSec[0]);
+    Motor::EncoderMeasurement measurements[kWheelCount] = {};
+    std::size_t measurementCount = Motor::encoderMeasurements(measurements, kWheelCount);
+
+    for (size_t i = 0; i < kWheelCount; ++i)
     {
-        throttleValue = 0;
-    }
-    else if (throttleValue > 2000)
-    {
-        throttleValue = 2000;
+        float mmps = 0.0f;
+        if (i < measurementCount && measurements[i].valid)
+        {
+            mmps = measurements[i].metersPerSecond * 1000.0f;
+        }
+        if (mmps > 32767.0f)
+        {
+            mmps = 32767.0f;
+        }
+        else if (mmps < -32768.0f)
+        {
+            mmps = -32768.0f;
+        }
+        packet.wheelSpeedMmPerSec[i] = static_cast<int16_t>(mmps);
     }
 
-    GillTelemetryPacket packet{
-        PACKET_MAGIC,
-        0.0f, 0.0f, 0.0f,
-        currentOutputs.leftFront / 1000.0f,
-        currentOutputs.leftRear / 1000.0f,
-        currentOutputs.rightFront / 1000.0f,
-        static_cast<uint16_t>(throttleValue),
-        static_cast<int8_t>(constrain(targetOutputs.leftFront / 8, -128, 127)),
-        static_cast<int8_t>(constrain(targetOutputs.rightFront / 8, -128, 127)),
-        static_cast<int8_t>(constrain(targetOutputs.leftRear / 8, -128, 127)),
-        0.0f,
-        0.0f,
-        commandAge
-    };
-
-    Comms::LinkStatus status = Comms::getLinkStatus();
-    if (status.paired && !Comms::macEqual(status.peerMac, Comms::BroadcastMac))
+    float batteryVolts = AnalogInputs::readBatteryVoltage();
+    int32_t batteryMillivolts = static_cast<int32_t>(batteryVolts * 1000.0f + 0.5f);
+    if (batteryMillivolts < 0)
     {
-        esp_now_send(status.peerMac, reinterpret_cast<const uint8_t *>(&packet), sizeof(packet));
+        batteryMillivolts = 0;
     }
+    else if (batteryMillivolts > 0xFFFF)
+    {
+        batteryMillivolts = 0xFFFF;
+    }
+    packet.batteryMillivolts = static_cast<uint16_t>(batteryMillivolts);
+    updateBatterySafety(packet.batteryMillivolts);
+
+    std::memcpy(packet.ledPwm, gPeripheralState.ledPwm, sizeof(packet.ledPwm));
+    packet.pumpDuty = gPeripheralState.pumpDuty;
+    packet.userMask = gPeripheralState.userMask;
+
+    packet.flags = 0;
+    if (ArmControl::outputsEnabled())
+    {
+        packet.flags |= Comms::StatusFlag::ArmOutputsEnabled;
+    }
+    if (failsafe_enable)
+    {
+        packet.flags |= Comms::StatusFlag::FailsafeArmed;
+    }
+    if (telemetryEnabled)
+    {
+        packet.flags |= Comms::StatusFlag::TelemetryStreaming;
+    }
+    if (client && client.connected())
+    {
+        packet.flags |= Comms::StatusFlag::TcpClientActive;
+    }
+    if (serialActive)
+    {
+        packet.flags |= Comms::StatusFlag::SerialActive;
+    }
+    if (Comms::paired())
+    {
+        packet.flags |= Comms::StatusFlag::PairedLink;
+    }
+    if (g_batterySafetyEnabled && g_batteryProtectionLatched)
+    {
+        packet.flags |= Comms::StatusFlag::BatterySafeActive;
+    }
+    if (isArmed)
+    {
+        packet.flags |= Comms::StatusFlag::DriveArmed;
+    }
+
+    if (commandAge > 0xFFFF)
+    {
+        commandAge = 0xFFFF;
+    }
+    packet.commandAgeMs = static_cast<uint16_t>(commandAge);
+
+    Comms::sendStatusPacket(packet);
 
     bool tcpActive = client && client.connected();
     if (!(telemetryEnabled && (serialActive || tcpActive)))
         return;
 
-    String telemetry = "TG:0.00 0.00 0.00 " +
-                       String(currentOutputs.leftFront) + " " + String(currentOutputs.leftRear) + " " +
-                       String(currentOutputs.rightFront) + " " + String(currentOutputs.rightRear) + " " +
-                       String(currentCommand.leftFront) + " " + String(currentCommand.leftRear) + " " +
-                       String(currentCommand.rightFront) + " " + String(currentCommand.rightRear) + " " +
-                       String(commandAge);
+    String telemetry = String("STAT mv=") + String(packet.batteryMillivolts) +
+                       " mmps=" + String(packet.wheelSpeedMmPerSec[0]) + "," +
+                       String(packet.wheelSpeedMmPerSec[1]) + "," +
+                       String(packet.wheelSpeedMmPerSec[2]) + "," +
+                       String(packet.wheelSpeedMmPerSec[3]) +
+                       " pump=" + String(packet.pumpDuty) +
+                       " leds=" + String(packet.ledPwm[0]) + "," +
+                       String(packet.ledPwm[1]) + "," +
+                       String(packet.ledPwm[2]) +
+                       " user=0x" + String(packet.userMask, HEX) +
+                       " flags=0x" + String(packet.flags, HEX) +
+                       " age=" + String(packet.commandAgeMs);
 
     if (serialActive)
         Serial.println(telemetry);
@@ -581,10 +906,11 @@ void checkFailsafe() {
     static uint32_t lastRampUpdate = 0;
 
     uint32_t nowMs = millis();
-    uint32_t lastCommandMs = Comms::lastCommandTimestamp();
-    bool commandRecent = (lastCommandMs != 0 && nowMs >= lastCommandMs && (nowMs - lastCommandMs) <= FAILSAFE_TIMEOUT);
+    uint32_t lastHeartbeatMs = Comms::lastPeerHeartbeatTimestamp();
+    bool heartbeatRecent = (lastHeartbeatMs != 0 && nowMs >= lastHeartbeatMs &&
+                            (nowMs - lastHeartbeatMs) <= HEARTBEAT_TIMEOUT_MS);
 
-    if (commandRecent) {
+    if (heartbeatRecent) {
         rampingDown = false;
         return;
     }
@@ -596,6 +922,7 @@ void checkFailsafe() {
         if (ShiftRegister::initialized()) {
             ShiftRegister::clearAll();
         }
+        clearPeripheralState();
         // Disable arm outputs so STBY stays low and PID idles
         ArmControl::setOutputsEnabled(false);
     }
@@ -630,6 +957,7 @@ void checkFailsafe() {
         safe.flags |= GILL_FLAG_BRAKE;
         storeCommandSnapshot(safe);
         targetOutputs = commandToMotorOutputs(safe);
+        resetDriveEasing(targetOutputs);
     } else {
         rampingDown = false;
     }
@@ -656,6 +984,8 @@ void FastTask(void *pvParameters) {
             desired.rightRear = 0;
         }
 
+        desired = filterDriveCommand(desired, kLoopDtSeconds, isArmed && !brake);
+
         targetOutputs = desired;
         Motor::update(isArmed, brake, currentOutputs, targetOutputs);
         ArmControl::setOutputsEnabled(armControlEnabled);
@@ -669,7 +999,6 @@ void FastTask(void *pvParameters) {
         gillTelemetry.actualLeftRear = currentOutputs.leftRear / 1000.0f;
         gillTelemetry.actualRightFront = currentOutputs.rightFront / 1000.0f;
         gillTelemetry.actualRightRear = currentOutputs.rightRear / 1000.0f;
-        gillTelemetry.easingRate = currentCommand.easingRate;
         gillTelemetry.brakeActive = brake;
 
         static bool lastHonkFlag = false;
@@ -764,15 +1093,36 @@ void CommTask(void *pvParameters) {
         lastPaired = status.paired;
 
         uint32_t timestampMs = 0;
+        ConfigurationPacket configPacket{};
+        if (Comms::receiveConfigurationPacket(configPacket, &timestampMs)) {
+            (void)timestampMs;
+            applyConfigurationPacket(configPacket);
+        }
+
+        timestampMs = 0;
+        SettingsPacket settingsPacket{};
+        if (Comms::receiveSettingsPacket(settingsPacket, &timestampMs)) {
+            (void)timestampMs;
+            applySettingsPacket(settingsPacket);
+        }
+
+        timestampMs = 0;
         ArmControlCommand armCommand{};
-        ThegillCommand directCommand{};
-        Comms::ControlPacket packet{};
         if (Comms::receiveArmCommand(armCommand, &timestampMs)) {
             applyArmControlCommand(armCommand, timestampMs);
-        } else if (Comms::receiveThegillCommand(directCommand, &timestampMs)) {
+        }
+
+        timestampMs = 0;
+        ThegillCommand directCommand{};
+        if (Comms::receiveThegillCommand(directCommand, &timestampMs)) {
             applyThegillCommandPayload(directCommand, timestampMs);
-        } else if (Comms::receiveCommand(packet, &timestampMs)) {
-            applyControlPacket(packet, timestampMs);
+        }
+
+        timestampMs = 0;
+        Comms::PeripheralCommand peripheralCommand{};
+        if (Comms::receivePeripheralCommand(peripheralCommand, &timestampMs)) {
+            (void)timestampMs;
+            applyPeripheralCommand(peripheralCommand);
         }
 
         vTaskDelayUntil(&lastWake, interval);
@@ -793,7 +1143,7 @@ void TelemetryTask(void *pvParameters) {
     TickType_t lastWake = xTaskGetTickCount();
     const TickType_t interval = pdMS_TO_TICKS(10);
     while (true) {
-        streamTelemetry();
+        publishStatus();
         vTaskDelayUntil(&lastWake, interval);
     }
 }
@@ -808,6 +1158,7 @@ void OTATask(void *pvParameters) {
 // Ensure SR is cleared on system shutdown/reset to avoid stray outputs
 static void SRShutdownHandler() {
     ShiftRegister::clearAll();
+    clearPeripheralState();
 }
 
 
@@ -822,7 +1173,6 @@ void setup()
         ledcSetup(BUZZER_CHANNEL, 2000, 8);
         ledcAttachPin(BUZZER_PIN, BUZZER_CHANNEL);
         ledcWrite(BUZZER_CHANNEL, 0);
-        runBuzzerSelfTest();
         buzzerQueue = xQueueCreate(5, sizeof(BuzzerCommand));
         CREATE_TASK(
             BuzzerTask,
@@ -851,13 +1201,7 @@ void setup()
         }
     }
 
-     if (PeripheralTest::startBreathingTest()) {
-         Serial.println("Peripheral breathing test started at boot");
-     } else {
-         Serial.println("Peripheral breathing test failed to start");
-    }
-
-    
+    clearPeripheralState();
     // Register shutdown clear
     esp_register_shutdown_handler(&SRShutdownHandler);
 
@@ -880,7 +1224,7 @@ void setup()
     setCpuFrequencyMhz(CPU_FREQ_MHZ);
 
     Comms::setRole(Comms::DeviceRole::Controlled);
-    Comms::setPlatform("ThegillS3");
+    Comms::setPlatform(ROBOT_NAME);
     Comms::setCustomId(DRONE_ID);
     Comms::setDeviceTypeOverride("THEGILL");
 
@@ -908,6 +1252,16 @@ void setup()
             vTaskDelay(pdMS_TO_TICKS(1000));
         }
     }
+
+    ArmControl::setBaseTargetDegrees(180);
+    ArmControl::setExtensionTargetCentimeters(11);
+
+    ArmServos::setTargetDegrees(ArmServos::ServoId::Elbow,90);
+    ArmServos::setTargetDegrees(ArmServos::ServoId::Shoulder,90);
+    ArmServos::setTargetDegrees(ArmServos::ServoId::Pitch,90);
+    ArmServos::setTargetDegrees(ArmServos::ServoId::Yaw,90);
+    ArmServos::setTargetDegrees(ArmServos::ServoId::Roll,90);
+
     Motor::calibrate();
     // ensure motors are disarmed after calibration
     ThegillCommand initialCommand = loadCommandSnapshot();

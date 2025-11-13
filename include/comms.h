@@ -45,16 +45,38 @@ struct Packet {
     uint32_t reserved;
 };
 
-struct ControlPacket {
-    uint8_t replyIndex;
-    int8_t speed;
-    uint8_t motionState;
-    uint8_t buttonStates[3];
-    uint8_t ledPwm[3];       // PWM duty (0-255) for each high-power LED
-    uint8_t pumpIntensity;   // Pump PWM duty (0-255)
-    uint8_t commandByte;     // Bitmask for auxiliary user outputs/commands
+constexpr uint32_t THEGILL_PERIPHERAL_MAGIC = 0x54475043; // 'TGPC'
+struct PeripheralCommand {
+    uint32_t magic;
+    uint8_t ledPwm[3];    // PWM duty (0-255) for system/gripper/arm indicators
+    uint8_t pumpDuty;     // Pump PWM (0-255)
+    uint8_t userMask;     // Bits map to User0..User7 shift-register outputs
+    uint8_t reserved[3];
+};
+
+constexpr uint32_t THEGILL_STATUS_MAGIC = 0x54475354; // 'TGST'
+struct StatusPacket {
+    uint32_t magic;
+    int16_t wheelSpeedMmPerSec[4]; // Instantaneous speeds derived from encoders
+    uint16_t batteryMillivolts;
+    uint8_t ledPwm[3];
+    uint8_t pumpDuty;
+    uint8_t userMask;
+    uint8_t flags;        // See StatusFlag bits below
+    uint16_t commandAgeMs;
 };
 #pragma pack(pop)
+
+namespace StatusFlag {
+constexpr uint8_t ArmOutputsEnabled = 1u << 0;
+constexpr uint8_t FailsafeArmed     = 1u << 1;
+constexpr uint8_t TelemetryStreaming= 1u << 2;
+constexpr uint8_t TcpClientActive   = 1u << 3;
+constexpr uint8_t SerialActive      = 1u << 4;
+constexpr uint8_t PairedLink        = 1u << 5;
+constexpr uint8_t BatterySafeActive = 1u << 6;
+constexpr uint8_t DriveArmed        = 1u << 7;
+} // namespace StatusFlag
 
 struct DiscoveryInfo {
     Identity identity;
@@ -87,16 +109,22 @@ bool init(const char *ssid, const char *password, int tcpPort);
 bool init(const char *ssid, const char *password, int tcpPort, esp_now_recv_cb_t recvCallback);
 void loop();
 
-bool receiveCommand(ControlPacket &cmd, uint32_t *timestampMs = nullptr);
 bool receiveThegillCommand(ThegillCommand &cmd, uint32_t *timestampMs = nullptr);
 bool receiveArmCommand(ArmControlCommand &cmd, uint32_t *timestampMs = nullptr);
+bool receivePeripheralCommand(PeripheralCommand &cmd, uint32_t *timestampMs = nullptr);
+bool receiveConfigurationPacket(ConfigurationPacket &cmd, uint32_t *timestampMs = nullptr);
+bool receiveSettingsPacket(SettingsPacket &cmd, uint32_t *timestampMs = nullptr);
 uint32_t lastCommandTimestamp();
 uint32_t lastThegillCommandTimestamp();
 uint32_t lastArmCommandTimestamp();
+uint32_t lastConfigurationCommandTimestamp();
+uint32_t lastSettingsCommandTimestamp();
+uint32_t lastPeerHeartbeatTimestamp();
 LinkStatus getLinkStatus();
 bool paired();
+bool sendStatusPacket(const StatusPacket &packet);
+bool sendArmStatePacket(const ArmStatePacket &packet);
 
 extern const uint8_t BroadcastMac[6];
 
 } // namespace Comms
-

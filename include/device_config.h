@@ -96,7 +96,7 @@ constexpr uint8_t kBatterySensePin = 8;
 constexpr uint8_t kLeakSensePin = 9;
 constexpr uint8_t kAdcResolutionBits = 12;
 constexpr float kAdcReferenceVoltage = 3.3f;
-constexpr float kBatteryDividerRatio = 2.0f; // Update to match actual resistor divider
+constexpr float kBatteryDividerRatio = 15.15f; // Divider compensation to recover actual pack voltage
 constexpr float kLeakDividerRatio = 1.0f;    // Update if leak sensor uses scaling
 
 constexpr uint8_t kServoShoulderPin = 13;

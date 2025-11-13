@@ -12,7 +12,6 @@
 #include "motor.h"
 #include "thegill.h"
 #include "device_config.h"
-#include "peripheral_test.h"
 #include "shift_register.h"
 
 extern WiFiClient client;
@@ -152,47 +151,6 @@ bool parseServoName(const String &raw, ArmServos::ServoId &id) {
         return true;
     }
     return false;
-}
-
-bool parseDurationMs(const String &input, uint32_t &resultMs) {
-    String value = input;
-    value.trim();
-    if (value.length() == 0) {
-        return false;
-    }
-
-    bool explicitMs = false;
-    if (value.endsWith("ms")) {
-        explicitMs = true;
-        value.remove(value.length() - 2);
-        value.trim();
-    } else if (value.endsWith("s")) {
-        value.remove(value.length() - 1);
-        value.trim();
-    }
-
-    char *endPtr = nullptr;
-    float parsed = strtof(value.c_str(), &endPtr);
-    if (endPtr == value.c_str()) {
-        return false;
-    }
-    while (*endPtr && isspace(static_cast<unsigned char>(*endPtr))) {
-        ++endPtr;
-    }
-    if (*endPtr != '\0') {
-        return false;
-    }
-
-    float milliseconds = explicitMs ? parsed : (parsed * 1000.0f);
-    if (milliseconds <= 0.0f) {
-        return false;
-    }
-    if (milliseconds > 600000.0f) {
-        milliseconds = 600000.0f;
-    }
-
-    resultMs = static_cast<uint32_t>(milliseconds + 0.5f);
-    return true;
 }
 
 void printServoStatus() {
@@ -442,101 +400,6 @@ void handleCommand(const String &cmd) {
         snprintf(buffer, sizeof(buffer), "ACK: %s target set to %.1f°",
                  ArmServos::name(id), degrees);
         sendLine(buffer);
-    } else if (trimmed.startsWith("periph")) {
-        String args = trimmed.length() > 6 ? trimmed.substring(6) : String();
-        args.trim();
-        if (args.length() == 0 || args.equalsIgnoreCase("help")) {
-            sendLine("Peripheral commands:");
-            sendLine(" periph status");
-            sendLine(" periph test start|stop|run <duration>");
-            sendLine("Durations accept seconds by default or an 'ms' suffix (e.g. 10s, 5000ms).");
-            return;
-        }
-
-        String lowerArgs = args;
-        lowerArgs.toLowerCase();
-        if (lowerArgs == "status") {
-            PeripheralTest::Status st = PeripheralTest::status();
-            uint32_t remaining = 0;
-            if (st.autoStopEnabled && st.autoStopMs > st.elapsedMs) {
-                remaining = st.autoStopMs - st.elapsedMs;
-            }
-            char line[160];
-            if (st.autoStopEnabled) {
-                snprintf(line, sizeof(line),
-                         "Peripheral test: %s elapsed=%lums remaining=%lums",
-                         st.active ? "running" : "idle",
-                         static_cast<unsigned long>(st.elapsedMs),
-                         static_cast<unsigned long>(remaining));
-            } else {
-                snprintf(line, sizeof(line),
-                         "Peripheral test: %s elapsed=%lums (manual mode)",
-                         st.active ? "running" : "idle",
-                         static_cast<unsigned long>(st.elapsedMs));
-            }
-            sendLine(line);
-            return;
-        }
-
-        if (!lowerArgs.startsWith("test")) {
-            sendLine("ERROR: Unknown peripheral command");
-            return;
-        }
-
-        String params = args.length() > 4 ? args.substring(4) : String();
-        params.trim();
-        if (params.length() == 0) {
-            sendLine("ERROR: Missing periph test action (start|stop|run <duration>)");
-            return;
-        }
-
-        int spaceIndex = params.indexOf(' ');
-        String action = spaceIndex < 0 ? params : params.substring(0, spaceIndex);
-        String remainder = spaceIndex < 0 ? String() : params.substring(spaceIndex + 1);
-        action.trim();
-        remainder.trim();
-
-        if (action.equalsIgnoreCase("start")) {
-            bool alreadyRunning = PeripheralTest::active();
-            if (!PeripheralTest::startBreathingTest()) {
-                sendLine(ShiftRegister::initialized() ? "ERROR: Unable to start peripheral test" : "ERROR: Shift register not ready");
-                return;
-            }
-            sendLine(alreadyRunning ? "Peripheral test already running" : "ACK: Peripheral breathing test started");
-            return;
-        }
-
-        if (action.equalsIgnoreCase("stop")) {
-            if (!PeripheralTest::active()) {
-                sendLine("Peripheral test already idle");
-                return;
-            }
-            bool stopped = PeripheralTest::stopBreathingTest();
-            sendLine(stopped ? "ACK: Peripheral test stopped" : "ERROR: Timeout waiting for peripheral test to stop");
-            return;
-        }
-
-        if (action.equalsIgnoreCase("run")) {
-            if (remainder.length() == 0) {
-                sendLine("ERROR: Missing duration (e.g. periph test run 10s)");
-                return;
-            }
-            uint32_t durationMs = 0;
-            if (!parseDurationMs(remainder, durationMs)) {
-                sendLine("ERROR: Invalid duration. Use values like 10, 10s, or 5000ms.");
-                return;
-            }
-            if (!PeripheralTest::startBreathingTest(durationMs)) {
-                sendLine(ShiftRegister::initialized() ? "ERROR: Unable to start timed peripheral test" : "ERROR: Shift register not ready");
-                return;
-            }
-            char buffer[96];
-            snprintf(buffer, sizeof(buffer), "ACK: Peripheral test running for %lums", static_cast<unsigned long>(durationMs));
-            sendLine(buffer);
-            return;
-        }
-
-        sendLine("ERROR: Unknown periph test action");
     } else {
         sendLine("ERROR: Unknown command");
     }
