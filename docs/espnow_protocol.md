@@ -139,6 +139,7 @@ The rover sends an `ArmStatePacket` whenever it sees `GillSystemCommand::Request
 struct ArmControlCommand {
     uint32_t magic;                 // 0x54474152 ("TGAR")
     float extensionMillimeters;
+    float baseDegrees;
     float shoulderDegrees;
     float elbowDegrees;
     float pitchDegrees;
@@ -152,8 +153,15 @@ struct ArmControlCommand {
 ```
 
 - Set the relevant `ArmCommandMask` bit for each value you want applied.
+- `ArmCommandMask::Extension` drives the prismatic actuator (millimeters), while `ArmCommandMask::Base` updates the rotary axis (degrees). Servo bits (`Shoulder … Yaw`) map to the five hobby servos, and `Gripper1/2` control the left/right DC grippers by choosing a direction.
 - Use `ArmCommandFlag::EnableOutputs/DisableOutputs` (and the servo equivalents) to power down the arm safely.
 - The rover will also honor broadcast arm packets, enabling “one-to-many” teleoperation rigs.
+- **Gripper semantics:** The grippers are simple brushed motors with no position feedback. When `ArmCommandMask::Gripper1` (or `Gripper2`) is set, the rover inspects the associated float:
+  - value ≥ `kGripperCommandThreshold` → **Close** (forward polarity)
+  - value ≤ `-kGripperCommandThreshold` → **Open** (reverse polarity)
+  - otherwise → **Stop**
+
+  You can treat the field as a signed command (e.g., −1.0 open, 0 idle, +1.0 close); exact magnitudes don’t matter beyond picking the sign.
 
 ### Peripheral Command (`PeripheralCommand`)
 

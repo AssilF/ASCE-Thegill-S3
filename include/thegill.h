@@ -50,9 +50,10 @@ constexpr uint16_t Roll       = 1u << 4;
 constexpr uint16_t Yaw        = 1u << 5;
 constexpr uint16_t Gripper1   = 1u << 6;
 constexpr uint16_t Gripper2   = 1u << 7;
+constexpr uint16_t Base       = 1u << 8;
 constexpr uint16_t AllServos  = Shoulder | Elbow | Pitch | Roll | Yaw;
 constexpr uint16_t AllGrippers = Gripper1 | Gripper2;
-constexpr uint16_t AllOutputs = Extension | AllServos | AllGrippers;
+constexpr uint16_t AllOutputs = Extension | Base | AllServos | AllGrippers;
 } // namespace ArmCommandMask
 
 namespace ArmCommandFlag {
@@ -65,6 +66,7 @@ constexpr uint8_t DisableServos  = 0x08;
 struct ArmControlCommand {
     uint32_t magic;
     float extensionMillimeters;
+    float baseDegrees;
     float shoulderDegrees;
     float elbowDegrees;
     float pitchDegrees;

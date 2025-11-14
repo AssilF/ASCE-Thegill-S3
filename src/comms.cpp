@@ -539,26 +539,7 @@ void loop() {
     if (!g_initialized) {
         return;
     }
-
-    uint32_t nowMs = millis();
-
-    if (!g_linkStatus.paired) {
-        if (nowMs - g_lastBroadcastMs >= BROADCAST_INTERVAL_MS) {
-            g_lastBroadcastMs = nowMs;
-            if (g_role == DeviceRole::Controller) {
-                sendPacket(BroadcastMac, MessageType::MSG_PAIR_REQ);
-            } else {
-                sendPacket(BroadcastMac, MessageType::MSG_IDENTITY_REPLY);
-            }
-        }
-
-        if (g_role == DeviceRole::Controller && g_waitingForAck &&
-            nowMs - g_lastPairAttemptMs > LINK_TIMEOUT_MS) {
-            g_waitingForAck = false;
-        }
-    }
-
-    pruneDiscoveries(nowMs);
+    // Link reset/timeout logic disabled for stability during testing.
 }
 
 bool receiveArmCommand(ArmControlCommand &cmd, uint32_t *timestampMs) {

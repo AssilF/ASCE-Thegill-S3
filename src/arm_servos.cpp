@@ -117,7 +117,7 @@ void init() {
 
     ensureTimersCreated();
     gInitialised = true;
-    if (gEnabled && gFrameTimer) {
+    if (gFrameTimer) {
         esp_timer_start_periodic(gFrameTimer, kFramePeriodUs);
     }
 }
@@ -130,15 +130,12 @@ void setEnabled(bool enabled) {
     if (!gInitialised) {
         return;
     }
-    if (gFrameTimer) {
-        if (gEnabled) {
-            esp_timer_start_periodic(gFrameTimer, kFramePeriodUs);
-        } else {
-            esp_timer_stop(gFrameTimer);
-            // Ensure all outputs LOW
-            for (size_t i = 0; i < kServoCount; ++i) {
-                digitalWrite(gPins[i], LOW);
+    if (!gEnabled) {
+        for (size_t i = 0; i < kServoCount; ++i) {
+            if (gOffTimers[i]) {
+                esp_timer_stop(gOffTimers[i]);
             }
+            digitalWrite(gPins[i], LOW);
         }
     }
 }

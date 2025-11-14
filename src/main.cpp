@@ -67,6 +67,8 @@ struct PeripheralState {
 
 static PeripheralState gPeripheralState{};
 
+enum class GripperDirection : uint8_t;
+
 static void publishStatus();
 static void applyConfigurationPacket(const ConfigurationPacket &packet);
 static void applySettingsPacket(const SettingsPacket &packet);
@@ -75,6 +77,10 @@ static Motor::Outputs filterDriveCommand(const Motor::Outputs &target, float dtS
 static void resetDriveEasing(const Motor::Outputs &value);
 static void updateBatterySafety(uint16_t batteryMillivolts);
 static void reconfigureSoftAp(const char *ssid, const char *password);
+static void forceArmOutputsIfNeeded();
+static void setDefaultArmPose();
+static void setGripperTarget(std::size_t index, GripperDirection direction);
+static void applyGripperOutputs();
 
 
 /// ==================== CONSTANTS ====================
@@ -89,6 +95,11 @@ const unsigned long HEARTBEAT_TIMEOUT_MS = 2000;  // ms without controller traff
 const unsigned long TELEMETRY_INTERVAL = 50; // ms
 bool failsafe_enable = false;
 bool isArmed = true;
+constexpr float kDefaultServoDegrees = 90.0f;
+constexpr float kDefaultBaseDegrees = 180.0f;
+constexpr bool kForceArmOutputsEnabled = true;
+constexpr float kGripperDegreesNeutral = 90.0f;
+constexpr float kGripperCommandThreshold = 0.2f;
 static DriveEasingMode g_driveEasingMode = DriveEasingMode::None;
 static uint8_t g_driveEasingRate = 0;
 static Motor::Outputs g_easedOutputs{0, 0, 0, 0};
@@ -107,6 +118,16 @@ struct BuzzerCommand {
     uint16_t freqs[3];
 };
 
+enum class GripperDirection : uint8_t {
+    Stop = 0,
+    Open,
+    Close,
+};
+
+struct GripperState {
+    GripperDirection direction[2] = {GripperDirection::Stop, GripperDirection::Stop};
+};
+
 // ==================== GLOBAL VARIABLES ====================
 // Hardware
 WiFiServer server(TCP_PORT);
@@ -119,6 +140,7 @@ ThegillTelemetry gillTelemetry{};
 unsigned long lastTelemetry = 0;
 QueueHandle_t buzzerQueue = nullptr;
 bool buzzerMuted = false;
+static GripperState gGripperState{};
 
 // ==================== COMMUNICATION FUNCTIONS ====================
 bool telemetryEnabled = false; // Serial/TCP telemetry disabled by default
@@ -193,6 +215,86 @@ static inline bool copyBoundedString(char *dest, size_t destSize, const char *sr
 static void resetDriveEasing(const Motor::Outputs &value)
 {
     g_easedOutputs = value;
+}
+
+static void forceArmOutputsIfNeeded()
+{
+    if (!kForceArmOutputsEnabled)
+    {
+        return;
+    }
+    armControlEnabled = true;
+    ArmControl::setOutputsEnabled(true);
+    ArmServos::setEnabled(true);
+}
+
+static void setDefaultArmPose()
+{
+    ArmControl::setBaseTargetDegrees(kDefaultBaseDegrees);
+    ArmControl::setExtensionTargetCentimeters(config::arm::kExtensionMaxCentimeters);
+    for (int idx = 0; idx < static_cast<int>(ArmServos::ServoId::Count); ++idx)
+    {
+        ArmServos::setTargetDegrees(static_cast<ArmServos::ServoId>(idx), kDefaultServoDegrees);
+    }
+}
+
+static bool driveGripperChannel(std::size_t index, GripperDirection direction)
+{
+    const ShiftRegister::Output pwm = index == 0 ? ShiftRegister::Output::GripperPwmA
+                                                 : ShiftRegister::Output::GripperPwmB;
+    const ShiftRegister::Output in1 = index == 0 ? ShiftRegister::Output::GripperAIn1
+                                                 : ShiftRegister::Output::GripperBIn1;
+    const ShiftRegister::Output in2 = index == 0 ? ShiftRegister::Output::GripperAIn2
+                                                 : ShiftRegister::Output::GripperBIn2;
+
+    bool closing = direction == GripperDirection::Close;
+    bool opening = direction == GripperDirection::Open;
+    bool active = closing || opening;
+
+    ShiftRegister::writeChannel(in1, closing);
+    ShiftRegister::writeChannel(in2, opening);
+    ShiftRegister::writeChannelPwm(pwm, active ? 255 : 0);
+    return active;
+}
+
+static void applyGripperOutputs()
+{
+    if (!ShiftRegister::initialized())
+    {
+        return;
+    }
+    bool activeA = driveGripperChannel(0, gGripperState.direction[0]);
+    bool activeB = driveGripperChannel(1, gGripperState.direction[1]);
+    ShiftRegister::writeChannel(ShiftRegister::Output::GripperStandby, activeA || activeB);
+}
+
+static void setGripperTarget(std::size_t index, GripperDirection direction)
+{
+    if (index >= 2)
+    {
+        return;
+    }
+    gGripperState.direction[index] = direction;
+    applyGripperOutputs();
+}
+
+static GripperDirection decodeGripperValue(float value)
+{
+    float sample = value;
+    if (value >= 0.0f && value <= 180.0f)
+    {
+        sample = (value - kGripperDegreesNeutral) / kGripperDegreesNeutral;
+    }
+    const float threshold = kGripperCommandThreshold;
+    if (sample >= threshold)
+    {
+        return GripperDirection::Close;
+    }
+    if (sample <= -threshold)
+    {
+        return GripperDirection::Open;
+    }
+    return GripperDirection::Stop;
 }
 
 static Motor::Outputs filterDriveCommand(const Motor::Outputs &target, float dtSeconds, bool allowEasing)
@@ -354,14 +456,22 @@ static void updateBatterySafety(uint16_t batteryMillivolts)
         resetDriveEasing(outputs);
         Motor::update(false, true, currentOutputs, targetOutputs);
 
-        ArmControl::setOutputsEnabled(false);
-        ArmServos::setEnabled(false);
+        if (!kForceArmOutputsEnabled)
+        {
+            ArmControl::setOutputsEnabled(false);
+            ArmServos::setEnabled(false);
+        }
+        else
+        {
+            forceArmOutputsIfNeeded();
+        }
     }
     else if (g_batteryProtectionLatched && batteryMillivolts >= g_batteryRecoverMv)
     {
         g_batteryProtectionLatched = false;
         ArmControl::setOutputsEnabled(armControlEnabled);
         ArmServos::setEnabled(armControlEnabled);
+        forceArmOutputsIfNeeded();
     }
 }
 
@@ -409,6 +519,7 @@ static void applyConfigurationPacket(const ConfigurationPacket &packet)
         ArmControl::setOutputsEnabled(armControlEnabled);
         ArmServos::setEnabled(armControlEnabled);
     }
+    forceArmOutputsIfNeeded();
 
     failsafe_enable = (packet.controlFlags & ConfigFlag::FailsafeEnable) != 0;
 
@@ -438,12 +549,17 @@ static void syncPeripheralOutputs()
         return;
     }
 
+    auto invertDuty = [](uint8_t duty) -> uint8_t {
+        return static_cast<uint8_t>(255 - duty);
+    };
+
     for (uint8_t i = 0; i < 3; ++i)
     {
-        ShiftRegister::writeChannelPwm(kHighPowerLedOutputs[i], gPeripheralState.ledPwm[i]);
+        uint8_t duty = invertDuty(gPeripheralState.ledPwm[i]);
+        ShiftRegister::writeChannelPwm(kHighPowerLedOutputs[i], duty);
     }
 
-    ShiftRegister::writeChannelPwm(ShiftRegister::Output::PumpControl, gPeripheralState.pumpDuty);
+    ShiftRegister::writeChannelPwm(ShiftRegister::Output::PumpControl, invertDuty(gPeripheralState.pumpDuty));
     ShiftRegister::writeUserMask(gPeripheralState.userMask);
 }
 
@@ -526,6 +642,10 @@ static void applyArmControlCommand(const ArmControlCommand &packet, uint32_t tim
         float centimeters = packet.extensionMillimeters * 0.1f;
         ArmControl::setExtensionTargetCentimeters(centimeters);
     }
+    if (packet.validMask & ArmCommandMask::Base)
+    {
+        ArmControl::setBaseTargetDegrees(packet.baseDegrees);
+    }
     if (packet.validMask & ArmCommandMask::Shoulder)
     {
         ArmServos::setTargetDegrees(ArmServos::ServoId::Shoulder, packet.shoulderDegrees);
@@ -546,8 +666,21 @@ static void applyArmControlCommand(const ArmControlCommand &packet, uint32_t tim
     {
         ArmServos::setTargetDegrees(ArmServos::ServoId::Yaw, packet.yawDegrees);
     }
+    if (packet.validMask & ArmCommandMask::Gripper1)
+    {
+        setGripperTarget(0, decodeGripperValue(packet.gripper1Degrees));
+    }
+    if (packet.validMask & ArmCommandMask::Gripper2)
+    {
+        setGripperTarget(1, decodeGripperValue(packet.gripper2Degrees));
+    }
 
+    forceArmOutputsIfNeeded();
     armControlEnabled = ArmControl::outputsEnabled();
+    if (kForceArmOutputsEnabled)
+    {
+        armControlEnabled = true;
+    }
 }
 
 static void applyThegillCommandPayload(const ThegillCommand &packet, uint32_t timestampMs)
@@ -899,68 +1032,8 @@ void handleIncomingData()
 // ==================== FAILSAFE LOGIC ====================
 
 void checkFailsafe() {
-    if (!failsafe_enable)
-        return;
-
-    static bool rampingDown = false;
-    static uint32_t lastRampUpdate = 0;
-
-    uint32_t nowMs = millis();
-    uint32_t lastHeartbeatMs = Comms::lastPeerHeartbeatTimestamp();
-    bool heartbeatRecent = (lastHeartbeatMs != 0 && nowMs >= lastHeartbeatMs &&
-                            (nowMs - lastHeartbeatMs) <= HEARTBEAT_TIMEOUT_MS);
-
-    if (heartbeatRecent) {
-        rampingDown = false;
-        return;
-    }
-
-    if (!rampingDown) {
-        rampingDown = true;
-        lastRampUpdate = nowMs;
-        // Immediately drop all shift-register outputs (LEDs, pump, aux) to avoid unintended actuation
-        if (ShiftRegister::initialized()) {
-            ShiftRegister::clearAll();
-        }
-        clearPeripheralState();
-        // Disable arm outputs so STBY stays low and PID idles
-        ArmControl::setOutputsEnabled(false);
-    }
-
-    const uint32_t rampIntervalMs = 50;
-    if (nowMs - lastRampUpdate < rampIntervalMs)
-        return;
-    lastRampUpdate = nowMs;
-
-    ThegillCommand safe = loadCommandSnapshot();
-    bool changed = false;
-
-    auto rampValue = [&](int16_t *value) {
-        int16_t original = *value;
-        if (*value > 0) {
-            int16_t next = *value - 20;
-            *value = next < 0 ? 0 : next;
-        } else if (*value < 0) {
-            int16_t next = *value + 20;
-            *value = next > 0 ? 0 : next;
-        }
-        if (*value != original)
-            changed = true;
-    };
-
-    rampValue(&safe.leftFront);
-    rampValue(&safe.leftRear);
-    rampValue(&safe.rightFront);
-    rampValue(&safe.rightRear);
-
-    if (changed) {
-        safe.flags |= GILL_FLAG_BRAKE;
-        storeCommandSnapshot(safe);
-        targetOutputs = commandToMotorOutputs(safe);
-        resetDriveEasing(targetOutputs);
-    } else {
-        rampingDown = false;
-    }
+    // Connection timeout handling disabled (keep link latched for testing).
+    (void)failsafe_enable;
 }
 
 
@@ -1202,6 +1275,8 @@ void setup()
     }
 
     clearPeripheralState();
+    setGripperTarget(0, GripperDirection::Stop);
+    setGripperTarget(1, GripperDirection::Stop);
     // Register shutdown clear
     esp_register_shutdown_handler(&SRShutdownHandler);
 
@@ -1220,6 +1295,8 @@ void setup()
     ArmControl::setOutputsEnabled(armControlEnabled);
     ArmServos::init();
     ArmServos::setEnabled(armControlEnabled);
+    setDefaultArmPose();
+    forceArmOutputsIfNeeded();
 
     setCpuFrequencyMhz(CPU_FREQ_MHZ);
 
@@ -1252,15 +1329,6 @@ void setup()
             vTaskDelay(pdMS_TO_TICKS(1000));
         }
     }
-
-    ArmControl::setBaseTargetDegrees(180);
-    ArmControl::setExtensionTargetCentimeters(11);
-
-    ArmServos::setTargetDegrees(ArmServos::ServoId::Elbow,90);
-    ArmServos::setTargetDegrees(ArmServos::ServoId::Shoulder,90);
-    ArmServos::setTargetDegrees(ArmServos::ServoId::Pitch,90);
-    ArmServos::setTargetDegrees(ArmServos::ServoId::Yaw,90);
-    ArmServos::setTargetDegrees(ArmServos::ServoId::Roll,90);
 
     Motor::calibrate();
     // ensure motors are disarmed after calibration
