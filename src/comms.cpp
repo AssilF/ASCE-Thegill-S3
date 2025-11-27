@@ -6,6 +6,10 @@
 #include <cstdio>
 #include <cstring>
 
+#ifndef COMMS_DEBUG
+#define COMMS_DEBUG 0
+#endif
+
 namespace Comms {
 namespace {
 
@@ -45,9 +49,56 @@ uint32_t g_lastSettingsPacketTimestamp = 0;
 
 uint32_t g_lastPeerHeartbeatTimestamp = 0;
 
+// Simple send backoff to avoid hammering when esp_now_send fails.
+uint32_t g_sendBackoffUntilMs = 0;
+uint8_t g_sendFailCount = 0;
+
+inline const char *messageTypeName(MessageType type) {
+    switch (type) {
+    case MessageType::MSG_PAIR_REQ: return "PAIR_REQ";
+    case MessageType::MSG_IDENTITY_REPLY: return "ID_REPLY";
+    case MessageType::MSG_PAIR_CONFIRM: return "PAIR_CONFIRM";
+    case MessageType::MSG_PAIR_ACK: return "PAIR_ACK";
+    case MessageType::MSG_KEEPALIVE: return "KEEPALIVE";
+    default: return "UNKNOWN";
+    }
+}
+
+inline bool isHandshake(MessageType type) {
+    return type == MessageType::MSG_PAIR_REQ ||
+           type == MessageType::MSG_IDENTITY_REPLY ||
+           type == MessageType::MSG_PAIR_CONFIRM ||
+           type == MessageType::MSG_PAIR_ACK;
+}
+
+inline void logPacketEvent(const char *label, const uint8_t mac[6]) {
+    if (!COMMS_DEBUG || !Serial) {
+        return;
+    }
+    Serial.print("[ESP-NOW] ");
+    Serial.print(label ? label : "event");
+    Serial.print(" from ");
+    Serial.printf("%02X:%02X:%02X:%02X:%02X:%02X",
+                  mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+    Serial.println();
+}
+
+inline void logPacketSend(MessageType type, const uint8_t mac[6]) {
+    if (!COMMS_DEBUG || !Serial) {
+        return;
+    }
+    Serial.print("[ESP-NOW] send ");
+    Serial.print(messageTypeName(type));
+    Serial.print(" to ");
+    Serial.printf("%02X:%02X:%02X:%02X:%02X:%02X",
+                  mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+    Serial.println();
+}
+
 bool g_initialized = false;
 uint32_t g_lastBroadcastMs = 0;
 uint32_t g_lastDiscoveryCleanupMs = 0;
+uint32_t g_lastKeepaliveMs = 0;
 
 bool g_waitingForAck = false;
 uint8_t g_pendingMac[6] = {0};
@@ -89,6 +140,11 @@ void sendPacket(const uint8_t *mac, MessageType type) {
     composeIdentity(packet.id);
     packet.monotonicMs = millis();
     packet.reserved = 0;
+    bool isBroadcast = macEqualBytes(mac, BroadcastMac);
+    if (!isBroadcast) {
+        ensurePeer(mac);
+    }
+    logPacketSend(type, mac);
     esp_now_send(mac, reinterpret_cast<const uint8_t *>(&packet), sizeof(packet));
 }
 
@@ -146,6 +202,9 @@ void clearLinkStatus() {
         }
     }
     g_linkStatus = LinkStatus{};
+    g_waitingForAck = false;
+    std::memset(g_pendingMac, 0, sizeof(g_pendingMac));
+    g_pendingIdentity = Identity{};
     g_pendingThegillCommand = false;
     g_pendingArmCommand = false;
     g_pendingPeripheralCommand = false;
@@ -157,17 +216,21 @@ void clearLinkStatus() {
     g_lastConfigurationPacketTimestamp = 0;
     g_lastSettingsPacketTimestamp = 0;
     g_lastPeerHeartbeatTimestamp = 0;
+    g_lastKeepaliveMs = 0;
 }
 
 void handlePairAck(uint32_t nowMs, const uint8_t mac[6], const Packet &packet) {
     if (!g_waitingForAck || !macEqualBytes(mac, g_pendingMac)) {
-        return;
+        // Allow re-ack from known peer to restore paired state
+        if (!(g_linkStatus.paired && macEqualBytes(mac, g_linkStatus.peerMac))) {
+            return;
+        }
     }
     g_waitingForAck = false;
     g_linkStatus.paired = true;
     g_linkStatus.peerIdentity = packet.id;
     std::memcpy(g_linkStatus.peerIdentity.mac, mac, 6);
-    std::memcpy(g_linkStatus.peerMac, g_pendingMac, 6);
+    std::memcpy(g_linkStatus.peerMac, mac, 6);
     g_linkStatus.lastActivityMs = nowMs;
     g_linkStatus.lastCommandMs = 0;
     g_lastPeerHeartbeatTimestamp = nowMs;
@@ -227,6 +290,20 @@ void handleIdentityReply(uint32_t nowMs, const uint8_t mac[6], const Packet &pac
 void onDataRecv(const uint8_t *mac, const uint8_t *incomingData, int len) {
     uint32_t nowMs = millis();
 
+    // Heartbeat: any traffic from paired peer except handshake/discovery counts.
+    if (g_linkStatus.paired && macEqualBytes(mac, g_linkStatus.peerMac)) {
+        if (len != static_cast<int>(sizeof(Packet))) {
+            g_lastPeerHeartbeatTimestamp = nowMs;
+            g_linkStatus.lastActivityMs = nowMs;
+        } else {
+            const Packet *pkt = reinterpret_cast<const Packet *>(incomingData);
+            if (pkt->version == PROTOCOL_VERSION && !isHandshake(pkt->type)) {
+                g_lastPeerHeartbeatTimestamp = nowMs;
+                g_linkStatus.lastActivityMs = nowMs;
+            }
+        }
+    }
+
     if (len == static_cast<int>(sizeof(Packet))) {
         const Packet *packet = reinterpret_cast<const Packet *>(incomingData);
         if (packet->version != PROTOCOL_VERSION) {
@@ -239,19 +316,28 @@ void onDataRecv(const uint8_t *mac, const uint8_t *incomingData, int len) {
         switch (packet->type) {
         case MessageType::MSG_PAIR_REQ:
             if (g_role == DeviceRole::Controlled && !g_linkStatus.paired) {
+                logPacketEvent("PAIR_REQ", mac);
+                // Respond directly to requester (no broadcast)
                 sendPacket(mac, MessageType::MSG_IDENTITY_REPLY);
             }
             break;
         case MessageType::MSG_IDENTITY_REPLY:
+            logPacketEvent("ID_REPLY", mac);
             handleIdentityReply(nowMs, mac, *packet);
             break;
         case MessageType::MSG_PAIR_CONFIRM:
             if (g_role == DeviceRole::Controlled) {
+                bool alreadyPaired = g_linkStatus.paired && macEqualBytes(mac, g_linkStatus.peerMac);
+                if (alreadyPaired) {
+                    break;
+                }
+                logPacketEvent("PAIR_CONFIRM", mac);
                 handlePairConfirm(nowMs, mac, *packet);
             }
             break;
         case MessageType::MSG_PAIR_ACK:
             if (g_role == DeviceRole::Controller) {
+                logPacketEvent("PAIR_ACK", mac);
                 handlePairAck(nowMs, mac, *packet);
             }
             break;
@@ -268,20 +354,6 @@ void onDataRecv(const uint8_t *mac, const uint8_t *incomingData, int len) {
             bool fromBroadcast = macEqualBytes(mac, BroadcastMac);
             bool fromPeer = g_linkStatus.paired && macEqualBytes(mac, g_linkStatus.peerMac);
 
-            if (!g_linkStatus.paired && !fromBroadcast) {
-                g_linkStatus.paired = true;
-                g_linkStatus.peerIdentity = Identity{};
-                std::memcpy(g_linkStatus.peerIdentity.mac, mac, 6);
-                std::memcpy(g_linkStatus.peerMac, mac, 6);
-                g_pendingThegillCommand = false;
-                g_pendingArmCommand = false;
-                g_pendingPeripheralCommand = false;
-                g_pendingConfigurationPacket = false;
-                g_pendingSettingsPacket = false;
-                ensurePeer(mac);
-                fromPeer = true;
-            }
-
             if (fromPeer || (fromBroadcast && g_linkStatus.paired)) {
                 g_lastPeripheralCommand = *packet;
                 g_pendingPeripheralCommand = true;
@@ -296,20 +368,6 @@ void onDataRecv(const uint8_t *mac, const uint8_t *incomingData, int len) {
             const ConfigurationPacket *packet = reinterpret_cast<const ConfigurationPacket *>(incomingData);
             bool fromBroadcast = macEqualBytes(mac, BroadcastMac);
             bool fromPeer = g_linkStatus.paired && macEqualBytes(mac, g_linkStatus.peerMac);
-
-            if (!g_linkStatus.paired && !fromBroadcast) {
-                g_linkStatus.paired = true;
-                g_linkStatus.peerIdentity = Identity{};
-                std::memcpy(g_linkStatus.peerIdentity.mac, mac, 6);
-                std::memcpy(g_linkStatus.peerMac, mac, 6);
-                g_pendingThegillCommand = false;
-                g_pendingArmCommand = false;
-                g_pendingPeripheralCommand = false;
-                g_pendingConfigurationPacket = false;
-                g_pendingSettingsPacket = false;
-                ensurePeer(mac);
-                fromPeer = true;
-            }
 
             if (fromPeer || (fromBroadcast && g_linkStatus.paired)) {
                 g_lastConfigurationPacket = *packet;
@@ -328,20 +386,6 @@ void onDataRecv(const uint8_t *mac, const uint8_t *incomingData, int len) {
             bool fromBroadcast = macEqualBytes(mac, BroadcastMac);
             bool fromPeer = g_linkStatus.paired && macEqualBytes(mac, g_linkStatus.peerMac);
 
-            if (!g_linkStatus.paired && !fromBroadcast) {
-                g_linkStatus.paired = true;
-                g_linkStatus.peerIdentity = Identity{};
-                std::memcpy(g_linkStatus.peerIdentity.mac, mac, 6);
-                std::memcpy(g_linkStatus.peerMac, mac, 6);
-                g_pendingThegillCommand = false;
-                g_pendingArmCommand = false;
-                g_pendingPeripheralCommand = false;
-                g_pendingConfigurationPacket = false;
-                g_pendingSettingsPacket = false;
-                ensurePeer(mac);
-                fromPeer = true;
-            }
-
             if (fromPeer || (fromBroadcast && g_linkStatus.paired)) {
                 g_lastSettingsPacket = *packet;
                 g_pendingSettingsPacket = true;
@@ -359,20 +403,6 @@ void onDataRecv(const uint8_t *mac, const uint8_t *incomingData, int len) {
             bool fromBroadcast = macEqualBytes(mac, BroadcastMac);
             bool fromPeer = g_linkStatus.paired && macEqualBytes(mac, g_linkStatus.peerMac);
 
-            if (!g_linkStatus.paired && !fromBroadcast) {
-                g_linkStatus.paired = true;
-                g_linkStatus.peerIdentity = Identity{};
-                std::memcpy(g_linkStatus.peerIdentity.mac, mac, 6);
-                std::memcpy(g_linkStatus.peerMac, mac, 6);
-                g_pendingThegillCommand = false;
-                g_pendingArmCommand = false;
-                g_pendingPeripheralCommand = false;
-                g_pendingConfigurationPacket = false;
-                g_pendingSettingsPacket = false;
-                ensurePeer(mac);
-                fromPeer = true;
-            }
-
             if (fromPeer || (fromBroadcast && g_linkStatus.paired)) {
                 g_lastArmCommand = *packet;
                 g_pendingArmCommand = true;
@@ -389,19 +419,6 @@ void onDataRecv(const uint8_t *mac, const uint8_t *incomingData, int len) {
         if (packet->magic == THEGILL_PACKET_MAGIC) {
             bool fromBroadcast = macEqualBytes(mac, BroadcastMac);
             bool fromPeer = g_linkStatus.paired && macEqualBytes(mac, g_linkStatus.peerMac);
-
-            if (!g_linkStatus.paired && !fromBroadcast) {
-                g_linkStatus.paired = true;
-                g_linkStatus.peerIdentity = Identity{};
-                std::memcpy(g_linkStatus.peerIdentity.mac, mac, 6);
-                std::memcpy(g_linkStatus.peerMac, mac, 6);
-                g_pendingArmCommand = false;
-                g_pendingPeripheralCommand = false;
-                g_pendingConfigurationPacket = false;
-                g_pendingSettingsPacket = false;
-                ensurePeer(mac);
-                fromPeer = true;
-            }
 
             if (fromPeer || (fromBroadcast && g_linkStatus.paired)) {
                 g_lastThegillCommand = *packet;
@@ -527,6 +544,7 @@ bool init(const char *ssid, const char *password, int tcpPort, esp_now_recv_cb_t
     g_discoveryCount = 0;
     g_lastBroadcastMs = millis();
     g_lastDiscoveryCleanupMs = g_lastBroadcastMs;
+    g_lastKeepaliveMs = 0;
     g_waitingForAck = false;
     std::memset(g_pendingMac, 0, sizeof(g_pendingMac));
     g_pendingIdentity = Identity{};
@@ -539,7 +557,8 @@ void loop() {
     if (!g_initialized) {
         return;
     }
-    // Link reset/timeout logic disabled for stability during testing.
+
+    // Timeout logic disabled.
 }
 
 bool receiveArmCommand(ArmControlCommand &cmd, uint32_t *timestampMs) {
@@ -642,29 +661,44 @@ bool paired() {
 }
 
 bool sendStatusPacket(const StatusPacket &packet) {
-    if (!g_initialized || !g_linkStatus.paired) {
+    uint32_t now = millis();
+    if (now < g_sendBackoffUntilMs) {
         return false;
     }
-    if (macEqualBytes(g_linkStatus.peerMac, BroadcastMac)) {
+    if (!g_initialized || !g_linkStatus.paired || macEqualBytes(g_linkStatus.peerMac, BroadcastMac)) {
         return false;
     }
     esp_err_t result = esp_now_send(g_linkStatus.peerMac,
                                     reinterpret_cast<const uint8_t *>(&packet),
                                     sizeof(packet));
-    return result == ESP_OK;
+    if (result == ESP_OK) {
+        g_sendFailCount = 0;
+        return true;
+    }
+    // Back off progressively on failures.
+    g_sendFailCount = std::min<uint8_t>(g_sendFailCount + 1, 10);
+    g_sendBackoffUntilMs = now + static_cast<uint32_t>(20 * g_sendFailCount);
+    return false;
 }
 
 bool sendArmStatePacket(const ArmStatePacket &packet) {
-    if (!g_initialized || !g_linkStatus.paired) {
+    uint32_t now = millis();
+    if (now < g_sendBackoffUntilMs) {
         return false;
     }
-    if (macEqualBytes(g_linkStatus.peerMac, BroadcastMac)) {
+    if (!g_initialized || !g_linkStatus.paired || macEqualBytes(g_linkStatus.peerMac, BroadcastMac)) {
         return false;
     }
     esp_err_t result = esp_now_send(g_linkStatus.peerMac,
                                     reinterpret_cast<const uint8_t *>(&packet),
                                     sizeof(packet));
-    return result == ESP_OK;
+    if (result == ESP_OK) {
+        g_sendFailCount = 0;
+        return true;
+    }
+    g_sendFailCount = std::min<uint8_t>(g_sendFailCount + 1, 10);
+    g_sendBackoffUntilMs = now + static_cast<uint32_t>(20 * g_sendFailCount);
+    return false;
 }
 
 } // namespace Comms

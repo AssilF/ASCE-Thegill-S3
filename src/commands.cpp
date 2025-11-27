@@ -211,7 +211,8 @@ void handleCommand(const String &cmd) {
                  String(currentOutputs.rightRear));
         sendLine(String("Armed: ") + (isArmed ? "yes" : "no") +
                  String(" Brake: ") + (gillTelemetry.brakeActive ? "on" : "off") +
-                 String(" Honk: ") + (gillTelemetry.honkActive ? "yes" : "no"));
+                 String(" Honk: ") + (gillTelemetry.honkActive ? "yes" : "no") +
+                 String(" PWM: ") + (Motor::dynamicFrequencyEnabled() ? "dynamic" : "fixed"));
     } else if (trimmed.equalsIgnoreCase("enc") || trimmed.equalsIgnoreCase("encoders")) {
         Motor::EncoderMeasurement readings[config::kMotorCount];
         std::size_t count = Motor::encoderMeasurements(readings, config::kMotorCount);
@@ -243,6 +244,14 @@ void handleCommand(const String &cmd) {
     } else if (trimmed == "telemetry off") {
         telemetryEnabled = false;
         sendLine("ACK: Telemetry disabled");
+    } else if (trimmed.equalsIgnoreCase("pwm dyn on") || trimmed.equalsIgnoreCase("pwm dynamic on")) {
+        Motor::setDynamicFrequencyEnabled(true);
+        sendLine("ACK: Dynamic motor PWM enabled");
+    } else if (trimmed.equalsIgnoreCase("pwm dyn off") || trimmed.equalsIgnoreCase("pwm dynamic off")) {
+        Motor::setDynamicFrequencyEnabled(false);
+        sendLine("ACK: Dynamic motor PWM disabled (fixed frequency)");
+    } else if (trimmed.equalsIgnoreCase("pwm dyn") || trimmed.equalsIgnoreCase("pwm dynamic")) {
+        sendLine(String("PWM mode: ") + (Motor::dynamicFrequencyEnabled() ? "dynamic" : "fixed"));
     } else if (trimmed == "ping") {
         sendLine("PONG");
     } else if (trimmed == "arm") {

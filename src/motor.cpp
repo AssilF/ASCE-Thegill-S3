@@ -43,6 +43,7 @@ constexpr float kCommandScale = 1000.0f;
 constexpr float kCommandDeadband = config::kMotorCommandDeadband;
 constexpr float kCommandDeadbandCounts = kCommandDeadband * kCommandScale;
 constexpr float kMetersPerTick = config::kMetersPerEncoderTick;
+constexpr uint32_t kFixedPwmFrequencyHz = config::kMotorPwmFixedFrequency;
 
 DriverState drivers[kMotorCount];
 PwmState pwmStates[kMotorCount];
@@ -51,6 +52,7 @@ hw_timer_t *pwmTimer = nullptr;
 portMUX_TYPE timerMux = portMUX_INITIALIZER_UNLOCKED;
 volatile uint64_t currentTicks = 0;
 volatile uint32_t alarmInterval = kDefaultIdleInterval;
+volatile bool dynamicPwmEnabled = config::kMotorDynamicPwmEnabledDefault;
 
 struct EncoderSample {
     EncoderMeasurement measurement{};
@@ -74,17 +76,28 @@ inline void setPinLevel(int pin, int level) {
     }
 }
 
+uint32_t sanitizeFrequency(uint32_t frequency) {
+    if (frequency == 0) {
+        return kPwmFrequencyMin == 0 ? 1 : kPwmFrequencyMin;
+    }
+    return frequency;
+}
+
 uint32_t chooseFrequency(float magnitude) {
+    if (!dynamicPwmEnabled) {
+        return sanitizeFrequency(kFixedPwmFrequencyHz);
+    }
+
     if (magnitude >= config::kMotorFrequencyThresholdMidHigh) {
-        return config::kMotorPwmFrequencyHigh;
+        return sanitizeFrequency(config::kMotorPwmFrequencyHigh);
     }
     if (magnitude >= config::kMotorFrequencyThresholdMidLow) {
-        return config::kMotorPwmFrequencyMidHigh;
+        return sanitizeFrequency(config::kMotorPwmFrequencyMidHigh);
     }
     if (magnitude >= config::kMotorFrequencyThresholdLow) {
-        return config::kMotorPwmFrequencyMidLow;
+        return sanitizeFrequency(config::kMotorPwmFrequencyMidLow);
     }
-    return config::kMotorPwmFrequencyLow;
+    return sanitizeFrequency(config::kMotorPwmFrequencyLow);
 }
 
 uint32_t computePeriodTicks(uint32_t frequency) {
@@ -208,8 +221,9 @@ void configureDriver(size_t index, const DriverPins &pins) {
         digitalWrite(pins.enablePin, LOW);
     }
 
+    uint32_t baseFrequency = chooseFrequency(0.0f);
     PwmState &pwm = pwmStates[index];
-    pwm.periodTicks = computePeriodTicks(config::kMotorPwmFrequencyLow);
+    pwm.periodTicks = computePeriodTicks(baseFrequency);
     pwm.onTicks = 0;
     pwm.cycleStart = 0;
     pwm.nextEvent = kDefaultIdleInterval;
@@ -417,6 +431,14 @@ void stop() {
     for (size_t i = 0; i < kMotorCount; ++i) {
         applyOutput(i, 0, false, false);
     }
+}
+
+void setDynamicFrequencyEnabled(bool enabled) {
+    dynamicPwmEnabled = enabled;
+}
+
+bool dynamicFrequencyEnabled() {
+    return dynamicPwmEnabled;
 }
 
 void update(bool enabled, bool brake, Outputs &current, const Outputs &target) {

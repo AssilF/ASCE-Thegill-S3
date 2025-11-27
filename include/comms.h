@@ -20,6 +20,7 @@ enum class MessageType : uint8_t {
     MSG_IDENTITY_REPLY = 0x02,
     MSG_PAIR_CONFIRM = 0x03,
     MSG_PAIR_ACK = 0x04,
+    MSG_KEEPALIVE = 0x05,
 };
 
 
@@ -27,7 +28,7 @@ constexpr uint8_t PROTOCOL_VERSION = 1;
 constexpr uint8_t WIFI_CHANNEL = 0;
 constexpr uint32_t BROADCAST_INTERVAL_MS = 500;
 constexpr uint32_t DEVICE_TTL_MS = 5000;
-constexpr uint32_t LINK_TIMEOUT_MS = 3000;
+constexpr uint32_t LINK_TIMEOUT_MS = 10000;
 
 #pragma pack(push, 1)
 struct Identity {

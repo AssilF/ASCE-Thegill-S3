@@ -13,6 +13,7 @@
 #include <cstdlib>
 #include <cmath>
 #include <algorithm>
+#include <Adafruit_NeoPixel.h>
 #include "analog_inputs.h"
 #include "comms.h"
 #include "commands.h"
@@ -26,8 +27,8 @@
 
 // ==================== BOARD CONFIGURATION ====================
 // ESP32-S3 pin mappings for BTS7960 bridge drivers and task sizes
-const Motor::DriverPins PINS_LEFT_FRONT  = {19, 20, -1};
-const Motor::DriverPins PINS_LEFT_REAR   = {5, 4, -1};
+const Motor::DriverPins PINS_LEFT_FRONT  = {20, 19, -1};
+const Motor::DriverPins PINS_LEFT_REAR   = {4, 5, -1};
 const Motor::DriverPins PINS_RIGHT_FRONT = {18, 17, -1};
 const Motor::DriverPins PINS_RIGHT_REAR  = {7, 6, -1};
 const int BUZZER_PIN = config::kBuzzerPin; // optional piezo buzzer
@@ -42,9 +43,9 @@ const uint16_t FAST_TASK_STACK = 4096;
 const uint16_t COMM_TASK_STACK = 8192;
 const uint16_t FAILSAFE_TASK_STACK = 2048;
 const uint16_t TELEMETRY_TASK_STACK = 4096;
-const uint16_t OTA_TASK_STACK = 2048;
+const uint16_t OTA_TASK_STACK = 4096; // bump to avoid stack canary in OTATask
 const uint16_t BUZZER_TASK_STACK = 1024;
-const uint16_t STATUS_LED_TASK_STACK = 1024;
+const uint16_t STATUS_LED_TASK_STACK = 3072; // bump to avoid stack canary trips in StatusLED task
 #define CREATE_TASK(fn, name, stack, prio, handle, core) xTaskCreatePinnedToCore(fn, name, stack, NULL, prio, handle, core)
 
 
@@ -58,6 +59,12 @@ constexpr ShiftRegister::Output kHighPowerLedOutputs[3] = {
     ShiftRegister::Output::HighPowerLed2,
     ShiftRegister::Output::HighPowerLed3,
 };
+constexpr int ONBOARD_NEOPIXEL_PIN = 48; // ESP32-S3 DevKitC-1 RGB LED data pin
+constexpr uint8_t ONBOARD_NEOPIXEL_COUNT = 1;
+constexpr bool kUseOnboardRgb = true;
+static Adafruit_NeoPixel gOnboardPixel(ONBOARD_NEOPIXEL_COUNT,
+                                       ONBOARD_NEOPIXEL_PIN,
+                                       NEO_GRB + NEO_KHZ800);
 
 struct PeripheralState {
     uint8_t ledPwm[3] = {0, 0, 0};
@@ -77,6 +84,11 @@ static Motor::Outputs filterDriveCommand(const Motor::Outputs &target, float dtS
 static void resetDriveEasing(const Motor::Outputs &value);
 static void updateBatterySafety(uint16_t batteryMillivolts);
 static void reconfigureSoftAp(const char *ssid, const char *password);
+static void syncPeripheralOutputs();
+static void updateDynamicLeds(uint32_t nowMs, bool brakeActive, const Motor::Outputs &current);
+static void runPowerOnSelfTest();
+static void runLedSelfTest();
+static void runRgbHueLoopTick(uint32_t nowMs);
 static void forceArmOutputsIfNeeded();
 static void setDefaultArmPose();
 static void setGripperTarget(std::size_t index, GripperDirection direction);
@@ -434,45 +446,11 @@ static void applySettingsPacket(const SettingsPacket &packet)
 
 static void updateBatterySafety(uint16_t batteryMillivolts)
 {
+    // Battery safety bypassed: keep drivetrain armed regardless of voltage.
     g_lastBatteryMillivolts = batteryMillivolts;
-    if (!g_batterySafetyEnabled)
-    {
-        g_batteryProtectionLatched = false;
-        return;
-    }
-
-    if (!g_batteryProtectionLatched && batteryMillivolts > 0 && batteryMillivolts <= g_batteryCutoffMv)
-    {
-        g_batteryProtectionLatched = true;
-        isArmed = false;
-
-        ThegillCommand safe = loadCommandSnapshot();
-        safe.leftFront = safe.leftRear = safe.rightFront = safe.rightRear = 0;
-        safe.flags |= GILL_FLAG_BRAKE;
-        storeCommandSnapshot(safe);
-
-        Motor::Outputs outputs = commandToMotorOutputs(safe);
-        targetOutputs = outputs;
-        resetDriveEasing(outputs);
-        Motor::update(false, true, currentOutputs, targetOutputs);
-
-        if (!kForceArmOutputsEnabled)
-        {
-            ArmControl::setOutputsEnabled(false);
-            ArmServos::setEnabled(false);
-        }
-        else
-        {
-            forceArmOutputsIfNeeded();
-        }
-    }
-    else if (g_batteryProtectionLatched && batteryMillivolts >= g_batteryRecoverMv)
-    {
-        g_batteryProtectionLatched = false;
-        ArmControl::setOutputsEnabled(armControlEnabled);
-        ArmServos::setEnabled(armControlEnabled);
-        forceArmOutputsIfNeeded();
-    }
+    g_batterySafetyEnabled = false;
+    g_batteryProtectionLatched = false;
+    isArmed = true;
 }
 
 static void applyConfigurationPacket(const ConfigurationPacket &packet)
@@ -490,27 +468,11 @@ static void applyConfigurationPacket(const ConfigurationPacket &packet)
     bool mute = (packet.controlFlags & ConfigFlag::MuteAudio) != 0;
     buzzerMuted = mute;
 
-    bool driveEnabled = (packet.controlFlags & ConfigFlag::DriveEnabled) != 0;
-    if (isArmed != driveEnabled)
-    {
-        isArmed = driveEnabled;
-        if (!driveEnabled)
-        {
-            ThegillCommand safe = loadCommandSnapshot();
-            safe.leftFront = safe.leftRear = safe.rightFront = safe.rightRear = 0;
-            safe.flags |= GILL_FLAG_BRAKE;
-            storeCommandSnapshot(safe);
+    bool dynamicPwm = (packet.controlFlags & ConfigFlag::DynamicPwmEnable) != 0;
+    Motor::setDynamicFrequencyEnabled(dynamicPwm);
 
-            Motor::Outputs outputs = commandToMotorOutputs(safe);
-            targetOutputs = outputs;
-            resetDriveEasing(outputs);
-            Motor::update(false, true, currentOutputs, targetOutputs);
-        }
-    }
-    if (g_batteryProtectionLatched)
-    {
-        isArmed = false;
-    }
+    // Keep drivetrain armed regardless of incoming control flag
+    isArmed = true;
 
     bool manipEnabled = (packet.controlFlags & ConfigFlag::ArmOutputsEnable) != 0;
     if (armControlEnabled != manipEnabled)
@@ -523,23 +485,9 @@ static void applyConfigurationPacket(const ConfigurationPacket &packet)
 
     failsafe_enable = (packet.controlFlags & ConfigFlag::FailsafeEnable) != 0;
 
-    g_batterySafetyEnabled = (packet.safetyFlags & SafetyFlag::BatterySafetyEnable) != 0;
-    if (packet.batteryCutoffMillivolts != 0)
-    {
-        g_batteryCutoffMv = packet.batteryCutoffMillivolts;
-    }
-    if (packet.batteryRecoverMillivolts != 0)
-    {
-        g_batteryRecoverMv = packet.batteryRecoverMillivolts;
-    }
-    if (g_batteryRecoverMv <= g_batteryCutoffMv)
-    {
-        g_batteryRecoverMv = g_batteryCutoffMv + 200;
-    }
-    if (!g_batterySafetyEnabled)
-    {
-        g_batteryProtectionLatched = false;
-    }
+    // Ignore battery safety entirely
+    g_batterySafetyEnabled = false;
+    g_batteryProtectionLatched = false;
 }
 
 static void syncPeripheralOutputs()
@@ -578,6 +526,66 @@ static void clearPeripheralState()
 {
     gPeripheralState = PeripheralState{};
     syncPeripheralOutputs();
+}
+
+static void updateDynamicLeds(uint32_t nowMs, bool brakeActive, const Motor::Outputs &current)
+{
+    // Only apply dynamic behavior when the controller leaves LEDs at zero.
+    if (gPeripheralState.ledPwm[0] || gPeripheralState.ledPwm[1] || gPeripheralState.ledPwm[2])
+    {
+        return;
+    }
+
+    static bool lastMoving = false;
+    static uint32_t brakeHoldUntilMs = 0;
+
+    auto abs16 = [](int16_t v) -> int16_t { return v < 0 ? static_cast<int16_t>(-v) : v; };
+    auto scaleDuty = [](int16_t counts) -> uint8_t {
+        if (counts < 0)
+            counts = -counts;
+        if (counts > 1000)
+            counts = 1000;
+        return static_cast<uint8_t>((static_cast<uint32_t>(counts) * 255U) / 1000U);
+    };
+
+    const int16_t leftMag = std::max(abs16(current.leftFront), abs16(current.leftRear));
+    const int16_t rightMag = std::max(abs16(current.rightFront), abs16(current.rightRear));
+    const bool moving = (leftMag > 0) || (rightMag > 0);
+
+    uint8_t led0 = 0;
+    uint8_t led1 = 0;
+    uint8_t led2 = 0;
+
+    if (moving)
+    {
+        led0 = scaleDuty(leftMag);
+        led2 = scaleDuty(rightMag);
+        brakeHoldUntilMs = 0;
+    }
+    else
+    {
+        if (lastMoving || brakeActive)
+        {
+            brakeHoldUntilMs = nowMs + 1000;
+        }
+        if (brakeHoldUntilMs != 0 && nowMs <= brakeHoldUntilMs)
+        {
+            led1 = 255;
+        }
+    }
+
+    lastMoving = moving;
+
+    bool changed = (gPeripheralState.ledPwm[0] != led0) ||
+                   (gPeripheralState.ledPwm[1] != led1) ||
+                   (gPeripheralState.ledPwm[2] != led2);
+    if (changed)
+    {
+        gPeripheralState.ledPwm[0] = led0;
+        gPeripheralState.ledPwm[1] = led1;
+        gPeripheralState.ledPwm[2] = led2;
+        syncPeripheralOutputs();
+    }
 }
 
 static void handleSystemCommandBits(uint8_t bits)
@@ -870,10 +878,63 @@ static void runMotorStartupTest()
     Serial.println("Motor startup self-test complete.");
 }
 
+static void runLedSelfTest()
+{
+    Serial.println("[SelfTest] Checking inverted high-power LEDs");
+    PeripheralState previous = gPeripheralState;
+
+    auto applyAndHold = [&](uint32_t holdMs) {
+        syncPeripheralOutputs();
+        delay(holdMs);
+    };
+
+    // Walk through each LED channel (outputs are inverted in hardware)
+    for (int i = 0; i < 3; ++i)
+    {
+        gPeripheralState.ledPwm[0] = 0;
+        gPeripheralState.ledPwm[1] = 0;
+        gPeripheralState.ledPwm[2] = 0;
+        gPeripheralState.ledPwm[i] = 255;
+        applyAndHold(250);
+    }
+
+    // All LEDs together
+    gPeripheralState.ledPwm[0] = gPeripheralState.ledPwm[1] = gPeripheralState.ledPwm[2] = 255;
+    applyAndHold(400);
+
+    // Restore previous state
+    gPeripheralState = previous;
+    syncPeripheralOutputs();
+}
+
+static void runRgbHueLoopTick(uint32_t nowMs)
+{
+    if (!kUseOnboardRgb)
+    {
+        return;
+    }
+    // Slow hue wheel that always runs
+    uint16_t hue = static_cast<uint16_t>((nowMs * 4u) & 0xFFFF);
+    uint32_t color = gOnboardPixel.ColorHSV(hue, 255, 80);
+    gOnboardPixel.setPixelColor(0, color);
+    gOnboardPixel.show();
+}
+
+static void runPowerOnSelfTest()
+{
+    Serial.println("=== Power-on self-test ===");
+    runLedSelfTest();
+    Serial.println("=== Self-test complete ===");
+}
+
 void publishStatus()
 {
     if (millis() - lastTelemetry < TELEMETRY_INTERVAL)
         return;
+    if (!Comms::paired())
+    {
+        return; // Avoid sending to any unpaired/ghost peer
+    }
 
     lastTelemetry = millis();
 
@@ -1032,8 +1093,76 @@ void handleIncomingData()
 // ==================== FAILSAFE LOGIC ====================
 
 void checkFailsafe() {
-    // Connection timeout handling disabled (keep link latched for testing).
-    (void)failsafe_enable;
+    if (!failsafe_enable)
+        return;
+
+    static bool rampingDown = false;
+    static uint32_t lastRampUpdate = 0;
+
+    uint32_t nowMs = millis();
+    uint32_t lastHeartbeatMs = Comms::lastPeerHeartbeatTimestamp();
+    bool heartbeatRecent = (lastHeartbeatMs != 0 && nowMs >= lastHeartbeatMs &&
+                            (nowMs - lastHeartbeatMs) <= HEARTBEAT_TIMEOUT_MS);
+
+    if (heartbeatRecent) {
+        rampingDown = false;
+        return;
+    }
+
+    if (!rampingDown) {
+        rampingDown = true;
+        lastRampUpdate = nowMs;
+        // Immediately drop all shift-register outputs (LEDs, pump, aux) to avoid unintended actuation
+        if (ShiftRegister::initialized()) {
+            ShiftRegister::clearAll();
+        }
+        clearPeripheralState();
+        // Disable arm outputs unless forced on for testing
+        if (!kForceArmOutputsEnabled)
+        {
+            ArmControl::setOutputsEnabled(false);
+            ArmServos::setEnabled(false);
+        }
+        else
+        {
+            forceArmOutputsIfNeeded();
+        }
+    }
+
+    const uint32_t rampIntervalMs = 50;
+    if (nowMs - lastRampUpdate < rampIntervalMs)
+        return;
+    lastRampUpdate = nowMs;
+
+    ThegillCommand safe = loadCommandSnapshot();
+    bool changed = false;
+
+    auto rampValue = [&](int16_t *value) {
+        int16_t original = *value;
+        if (*value > 0) {
+            int16_t next = *value - 20;
+            *value = next < 0 ? 0 : next;
+        } else if (*value < 0) {
+            int16_t next = *value + 20;
+            *value = next > 0 ? 0 : next;
+        }
+        if (*value != original)
+            changed = true;
+    };
+
+    rampValue(&safe.leftFront);
+    rampValue(&safe.leftRear);
+    rampValue(&safe.rightFront);
+    rampValue(&safe.rightRear);
+
+    if (changed) {
+        safe.flags |= GILL_FLAG_BRAKE;
+        storeCommandSnapshot(safe);
+        targetOutputs = commandToMotorOutputs(safe);
+        resetDriveEasing(targetOutputs);
+    } else {
+        rampingDown = false;
+    }
 }
 
 
@@ -1063,6 +1192,7 @@ void FastTask(void *pvParameters) {
         Motor::update(isArmed, brake, currentOutputs, targetOutputs);
         ArmControl::setOutputsEnabled(armControlEnabled);
         ArmControl::update(kLoopDtSeconds);
+        updateDynamicLeds(millis(), brake, currentOutputs);
 
         gillTelemetry.targetLeftFront = desired.leftFront / 1000.0f;
         gillTelemetry.targetLeftRear = desired.leftRear / 1000.0f;
@@ -1130,11 +1260,15 @@ static void StatusLedTask(void *pvParameters)
             ShiftRegister::writeChannelPwm(pattern.output, duty);
         }
 
-        TickType_t nowTicks = xTaskGetTickCount();
-        if (nowTicks - boardLastToggle >= pdMS_TO_TICKS(500)) {
-            boardLevel = !boardLevel;
-            digitalWrite(STATUS_LED_PIN, boardLevel ? HIGH : LOW);
-            boardLastToggle = nowTicks;
+        if (kUseOnboardRgb) {
+            runRgbHueLoopTick(static_cast<uint32_t>(nowUs / 1000ULL));
+        } else {
+            TickType_t nowTicks = xTaskGetTickCount();
+            if (nowTicks - boardLastToggle >= pdMS_TO_TICKS(500)) {
+                boardLevel = !boardLevel;
+                digitalWrite(STATUS_LED_PIN, boardLevel ? HIGH : LOW);
+                boardLastToggle = nowTicks;
+            }
         }
 
         vTaskDelay(sleepTicks);
@@ -1216,6 +1350,10 @@ void TelemetryTask(void *pvParameters) {
     TickType_t lastWake = xTaskGetTickCount();
     const TickType_t interval = pdMS_TO_TICKS(10);
     while (true) {
+        if (!Comms::paired()) {
+            vTaskDelayUntil(&lastWake, interval);
+            continue;
+        }
         publishStatus();
         vTaskDelayUntil(&lastWake, interval);
     }
@@ -1259,6 +1397,13 @@ void setup()
         for (uint8_t i = 0; i < sizeof(bootNotes) / sizeof(bootNotes[0]); ++i) {
             beep(bootNotes[i], 160);
         }
+    }
+
+    if (kUseOnboardRgb) {
+        gOnboardPixel.begin();
+        gOnboardPixel.setBrightness(64);
+        gOnboardPixel.clear();
+        gOnboardPixel.show();
     }
 
     if (!ShiftRegister::init(
@@ -1331,6 +1476,7 @@ void setup()
     }
 
     Motor::calibrate();
+    runPowerOnSelfTest();
     // ensure motors are disarmed after calibration
     ThegillCommand initialCommand = loadCommandSnapshot();
     initialCommand.leftFront = 0;

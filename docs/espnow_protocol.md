@@ -84,6 +84,7 @@ The configuration packet moves all one-off toggles and drive-smoothing parameter
 | `DriveEnabled (0x02)` | When `0`, the rover disarms motors and applies the brake. |
 | `ArmOutputsEnable (0x04)` | Gate the arm H-bridges and servos. |
 | `FailsafeEnable (0x08)` | Enables/disables the link-loss failsafe task. |
+| `DynamicPwmEnable (0x10)` | Enable the magnitude-based PWM frequency hopping. Default is fixed-frequency PWM. |
 
 - **`safetyFlags`** (bitfield):
 

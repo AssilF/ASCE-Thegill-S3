@@ -30,6 +30,8 @@ bool init(const DriverPins &lf, const DriverPins &lr,
 void calibrate();
 void update(bool enabled, bool brake, Outputs &current, const Outputs &target);
 void stop();
+void setDynamicFrequencyEnabled(bool enabled);
+bool dynamicFrequencyEnabled();
 
 bool encoderMeasurement(std::size_t index, EncoderMeasurement &out);
 std::size_t encoderMeasurements(EncoderMeasurement *out, std::size_t maxCount);

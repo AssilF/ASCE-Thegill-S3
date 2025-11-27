@@ -91,6 +91,7 @@ constexpr uint8_t MuteAudio        = 1u << 0;
 constexpr uint8_t DriveEnabled     = 1u << 1;
 constexpr uint8_t ArmOutputsEnable = 1u << 2;
 constexpr uint8_t FailsafeEnable   = 1u << 3;
+constexpr uint8_t DynamicPwmEnable = 1u << 4;
 } // namespace ConfigFlag
 
 namespace SafetyFlag {
