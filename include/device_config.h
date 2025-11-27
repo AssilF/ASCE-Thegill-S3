@@ -43,7 +43,7 @@ constexpr bool kMotorDynamicPwmEnabledDefault = false;
 constexpr uint32_t kMotorPwmFixedFrequency = kMotorPwmFrequencyHigh;
 
 constexpr MotorPinConfig kMotorPins[kMotorCount] = {
-    {20, 19, 0, 1, 0, false},  // Front left motor (direction flipped)
+    {20, 19, 0, 1, 0, false},  // Front left motor (direction flipped; uses USB D+/D- pins, so USB-CDC must be off)
     {4, 5, 2, 3, 1, false},    // Rear left motor (direction flipped)
     {18, 17, 4, 5, 2, true},   // Front right motor
     {7, 6, 6, 7, 3, true},     // Rear right motor
