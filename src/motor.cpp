@@ -44,6 +44,9 @@ constexpr float kCommandDeadband = config::kMotorCommandDeadband;
 constexpr float kCommandDeadbandCounts = kCommandDeadband * kCommandScale;
 constexpr float kMetersPerTick = config::kMetersPerEncoderTick;
 constexpr uint32_t kFixedPwmFrequencyHz = config::kMotorPwmFixedFrequency;
+constexpr float kMaxSlewTimeSeconds = 0.5f;  // limit to reach a new target in <= 0.5s
+constexpr uint32_t kMaxSlewTimeMicros = 500000;  // mirror of 0.5s for integer math
+constexpr uint32_t kFallbackDtMicros = 2000;     // ~500 Hz expected loop
 
 DriverState drivers[kMotorCount];
 PwmState pwmStates[kMotorCount];
@@ -62,6 +65,7 @@ struct EncoderSample {
 };
 
 EncoderSample encoderSamples[kMotorCount];
+uint64_t lastUpdateMicros = 0;
 
 inline int16_t applyCommandDeadband(int16_t value) {
     if (fabsf(static_cast<float>(value)) <= kCommandDeadbandCounts) {
@@ -248,26 +252,21 @@ void applyOutput(size_t index, int16_t command, bool outputsEnabled, bool brake)
     }
 
     if (!pwmTimer) {
-        if (brake) {
+        // Coast by default: both direction pins LOW
+        setPinLevel(state.pins.forwardPin, LOW);
+        setPinLevel(state.pins.reversePin, LOW);
+
+        if (filteredCommand > 0) {
             setPinLevel(state.pins.forwardPin, HIGH);
-            setPinLevel(state.pins.reversePin, HIGH);
-        } else if (filteredCommand == 0) {
-            setPinLevel(state.pins.forwardPin, LOW);
-            setPinLevel(state.pins.reversePin, LOW);
-        } else if (filteredCommand > 0) {
-            setPinLevel(state.pins.forwardPin, HIGH);
-            setPinLevel(state.pins.reversePin, LOW);
-        } else {
-            setPinLevel(state.pins.forwardPin, LOW);
+        } else if (filteredCommand < 0) {
             setPinLevel(state.pins.reversePin, HIGH);
         }
 
         if (state.pins.enablePin >= 0) {
-            if (brake) {
-                digitalWrite(state.pins.enablePin, HIGH);
+            if (brake || filteredCommand == 0) {
+                digitalWrite(state.pins.enablePin, LOW);
             } else {
-                digitalWrite(state.pins.enablePin,
-                             filteredCommand != 0 ? HIGH : LOW);
+                digitalWrite(state.pins.enablePin, HIGH);
             }
         }
         return;
@@ -285,9 +284,9 @@ void applyOutput(size_t index, int16_t command, bool outputsEnabled, bool brake)
         pwm.onTicks = 0;
         pwm.activePin = kActiveNone;
         pwm.nextEvent = currentTicks + periodTicks;
-        setPinLevel(state.pins.forwardPin, HIGH);
-        setPinLevel(state.pins.reversePin, HIGH);
-        driverActive = true;
+        // Coast on brake: both direction lines low
+        setPinLevel(state.pins.forwardPin, LOW);
+        setPinLevel(state.pins.reversePin, LOW);
     } else if (filteredCommand == 0) {
         pwm.onTicks = 0;
         pwm.activePin = kActiveNone;
@@ -311,6 +310,7 @@ void applyOutput(size_t index, int16_t command, bool outputsEnabled, bool brake)
             pwm.onTicks = onTicks;
             pwm.activePin =
                 (filteredCommand > 0) ? kActiveForward : kActiveReverse;
+            // Always drop both lines before setting the active one to avoid shoot-through
             setPinLevel(state.pins.forwardPin, LOW);
             setPinLevel(state.pins.reversePin, LOW);
             pwm.nextEvent = currentTicks;
@@ -321,11 +321,8 @@ void applyOutput(size_t index, int16_t command, bool outputsEnabled, bool brake)
     portEXIT_CRITICAL(&timerMux);
 
     if (state.pins.enablePin >= 0) {
-        if (brake) {
-            digitalWrite(state.pins.enablePin, HIGH);
-        } else {
-            digitalWrite(state.pins.enablePin, driverActive ? HIGH : LOW);
-        }
+        // Enable only when actively driving
+        digitalWrite(state.pins.enablePin, (driverActive && !brake) ? HIGH : LOW);
     }
 }
 
@@ -446,6 +443,8 @@ void update(bool enabled, bool brake, Outputs &current, const Outputs &target) {
         return;
     }
 
+    Outputs previous = current;  // capture last applied values for slew limiting
+
     Outputs next{};
     if (brake) {
         next.leftFront = next.leftRear = next.rightFront = next.rightRear = 0;
@@ -470,6 +469,38 @@ void update(bool enabled, bool brake, Outputs &current, const Outputs &target) {
     } else {
         lf = lr = rf = rr = 0;
     }
+
+    // Time-aware slew limiting to avoid sudden changes; guarantee <=0.5s to reach new target
+    uint64_t nowMicros = micros();
+    uint32_t dtMicros = kFallbackDtMicros;
+    if (lastUpdateMicros != 0 && nowMicros > lastUpdateMicros) {
+        uint64_t delta = nowMicros - lastUpdateMicros;
+        dtMicros = static_cast<uint32_t>(std::min<uint64_t>(delta, kMaxSlewTimeMicros));
+    }
+    lastUpdateMicros = nowMicros;
+
+    auto slewChannel = [&](int16_t previousValue, int16_t desired) -> int16_t {
+        int32_t delta = static_cast<int32_t>(desired) - static_cast<int32_t>(previousValue);
+        if (delta == 0) {
+            return previousValue;
+        }
+        uint32_t mag = static_cast<uint32_t>(delta > 0 ? delta : -delta);
+        // step = ceil(mag * dt / maxTime)
+        uint32_t numer = mag * dtMicros + (kMaxSlewTimeMicros - 1);
+        uint32_t step = numer / kMaxSlewTimeMicros;
+        if (step == 0) {
+            step = 1;
+        }
+        if (step > mag) {
+            step = mag;
+        }
+        return static_cast<int16_t>(previousValue + (delta > 0 ? static_cast<int32_t>(step) : -static_cast<int32_t>(step)));
+    };
+
+    lf = slewChannel(previous.leftFront, lf);
+    lr = slewChannel(previous.leftRear, lr);
+    rf = slewChannel(previous.rightFront, rf);
+    rr = slewChannel(previous.rightRear, rr);
 
     applyOutput(0, lf, outputsEnabled, brake);
     applyOutput(1, lr, outputsEnabled, brake);

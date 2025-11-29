@@ -9,6 +9,7 @@
 #include <freertos/queue.h>
 #include <freertos/task.h>
 #include <freertos/portmacro.h>
+#include <esp_task_wdt.h>
 #include <cstring>
 #include <cstdlib>
 #include <cmath>
@@ -94,6 +95,13 @@ static void setDefaultArmPose();
 static void setGripperTarget(std::size_t index, GripperDirection direction);
 static void applyGripperOutputs();
 
+// Task handles for watchdog tracking
+static TaskHandle_t gFastTaskHandle = nullptr;
+static TaskHandle_t gCommTaskHandle = nullptr;
+static TaskHandle_t gFailsafeTaskHandle = nullptr;
+static TaskHandle_t gTelemetryTaskHandle = nullptr;
+static TaskHandle_t gStatusLedTaskHandle = nullptr;
+static bool gWdtReady = false;
 
 /// ==================== CONSTANTS ====================
 char WIFI_SSID[33] = "Thegill Telemetry";
@@ -530,6 +538,11 @@ static void clearPeripheralState()
 
 static void updateDynamicLeds(uint32_t nowMs, bool brakeActive, const Motor::Outputs &current)
 {
+    static uint32_t lastUpdateMs = 0;
+    if (lastUpdateMs != 0 && nowMs - lastUpdateMs < 20) { // throttle to ~50 Hz
+        return;
+    }
+    lastUpdateMs = nowMs;
     // Only apply dynamic behavior when the controller leaves LEDs at zero.
     if (gPeripheralState.ledPwm[0] || gPeripheralState.ledPwm[1] || gPeripheralState.ledPwm[2])
     {
@@ -1216,6 +1229,9 @@ void FastTask(void *pvParameters) {
         lastHonkFlag = honkFlag;
         gillTelemetry.honkActive = honkToggleState;
 
+        if (gWdtReady) {
+            esp_task_wdt_reset();
+        }
         vTaskDelayUntil(&lastWake, interval);
     }
 }
@@ -1271,6 +1287,9 @@ static void StatusLedTask(void *pvParameters)
             }
         }
 
+        if (gWdtReady) {
+            esp_task_wdt_reset();
+        }
         vTaskDelay(sleepTicks);
     }
 }
@@ -1332,6 +1351,9 @@ void CommTask(void *pvParameters) {
             applyPeripheralCommand(peripheralCommand);
         }
 
+        if (gWdtReady) {
+            esp_task_wdt_reset();
+        }
         vTaskDelayUntil(&lastWake, interval);
     }
 }
@@ -1342,6 +1364,9 @@ void FailsafeTask(void *pvParameters) {
     const TickType_t interval = pdMS_TO_TICKS(10);
     while (true) {
         checkFailsafe();
+        if (gWdtReady) {
+            esp_task_wdt_reset();
+        }
         vTaskDelayUntil(&lastWake, interval); // ~10 Hz
     }
 }
@@ -1351,10 +1376,16 @@ void TelemetryTask(void *pvParameters) {
     const TickType_t interval = pdMS_TO_TICKS(10);
     while (true) {
         if (!Comms::paired()) {
+            if (gWdtReady) {
+                esp_task_wdt_reset();
+            }
             vTaskDelayUntil(&lastWake, interval);
             continue;
         }
         publishStatus();
+        if (gWdtReady) {
+            esp_task_wdt_reset();
+        }
         vTaskDelayUntil(&lastWake, interval);
     }
 }
@@ -1370,6 +1401,7 @@ void OTATask(void *pvParameters) {
 static void SRShutdownHandler() {
     ShiftRegister::clearAll();
     clearPeripheralState();
+    Motor::stop();
 }
 
 
@@ -1466,6 +1498,11 @@ void setup()
     Serial.println(Comms::macToString(selfIdentity.mac));
     Serial.println("OTA service started");
 
+    // Configure a watchdog to recover from task hangs
+    if (esp_task_wdt_init(4, true) == ESP_OK) {
+        gWdtReady = true;
+    }
+
     // Initialize motor outputs
     if (!Motor::init(PINS_LEFT_FRONT, PINS_LEFT_REAR, PINS_RIGHT_FRONT, PINS_RIGHT_REAR)) {
         Serial.println("Motor init failed");
@@ -1497,7 +1534,7 @@ void setup()
         "FastTask",
         FAST_TASK_STACK,
         5,
-        NULL,
+        &gFastTaskHandle,
         1
     );
 
@@ -1506,7 +1543,7 @@ void setup()
         "CommTask",
         COMM_TASK_STACK,
         3,
-        NULL,
+        &gCommTaskHandle,
         0 // Pin to core 0 for Wi-Fi operations
     );
 
@@ -1515,7 +1552,7 @@ void setup()
         "StatusLED",
         STATUS_LED_TASK_STACK,
         1,
-        NULL,
+        &gStatusLedTaskHandle,
         1
     );
 
@@ -1524,7 +1561,7 @@ void setup()
         "FailsafeTask",
         FAILSAFE_TASK_STACK,
         1,
-        NULL,
+        &gFailsafeTaskHandle,
         1
     );
 
@@ -1533,7 +1570,7 @@ void setup()
         "TelemetryTask",
         TELEMETRY_TASK_STACK,
         2,
-        NULL,
+        &gTelemetryTaskHandle,
         0
     );
 
@@ -1546,6 +1583,14 @@ void setup()
         0
     );
     Serial.println("Tasks are here boi!");
+
+    if (gWdtReady) {
+        if (gFastTaskHandle) esp_task_wdt_add(gFastTaskHandle);
+        if (gCommTaskHandle) esp_task_wdt_add(gCommTaskHandle);
+        if (gFailsafeTaskHandle) esp_task_wdt_add(gFailsafeTaskHandle);
+        if (gTelemetryTaskHandle) esp_task_wdt_add(gTelemetryTaskHandle);
+        if (gStatusLedTaskHandle) esp_task_wdt_add(gStatusLedTaskHandle);
+    }
 }
 // ==================== MAIN LOOP ====================
 
