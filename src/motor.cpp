@@ -47,6 +47,8 @@ constexpr uint32_t kFixedPwmFrequencyHz = config::kMotorPwmFixedFrequency;
 constexpr float kMaxSlewTimeSeconds = 0.5f;  // limit to reach a new target in <= 0.5s
 constexpr uint32_t kMaxSlewTimeMicros = 500000;  // mirror of 0.5s for integer math
 constexpr uint32_t kFallbackDtMicros = 2000;     // ~500 Hz expected loop
+constexpr bool kSlewLimitingEnabled = false;     // Disable slew limiter to avoid pre-stop spikes
+constexpr uint32_t kMinAlarmIntervalTicks = 25;  // Clamp timer alarm (~25 us) to avoid ISR storms
 
 DriverState drivers[kMotorCount];
 PwmState pwmStates[kMotorCount];
@@ -116,8 +118,8 @@ inline void IRAM_ATTR setAlarmIntervalLocked(uint32_t interval) {
     if (!pwmTimer) {
         return;
     }
-    if (interval == 0) {
-        interval = 1;
+    if (interval < kMinAlarmIntervalTicks) {
+        interval = kMinAlarmIntervalTicks;
     }
     alarmInterval = interval;
     timerWrite(pwmTimer, 0);
@@ -133,7 +135,10 @@ void IRAM_ATTR handleDriverEvents(size_t index, uint64_t now) {
 
     const DriverPins &pins = drivers[index].pins;
 
-    while (pwm.nextEvent <= now) {
+    // Process only a limited number of steps to avoid long ISR lockouts that can trip the watchdog
+    constexpr uint8_t kMaxStepsPerIsr = 8;
+    uint8_t steps = 0;
+    while (pwm.nextEvent <= now && steps < kMaxStepsPerIsr) {
         if (pwm.phase == kPhaseStart) {
             pwm.cycleStart = pwm.nextEvent;
             setPinLevel(pins.forwardPin, LOW);
@@ -172,6 +177,16 @@ void IRAM_ATTR handleDriverEvents(size_t index, uint64_t now) {
             pwm.cycleStart += pwm.periodTicks;
             pwm.nextEvent = pwm.cycleStart;
         }
+        ++steps;
+    }
+
+    // If we are still behind schedule, resync to the current time boundary and drop outputs safely
+    if (pwm.nextEvent <= now) {
+        pwm.phase = kPhaseStart;
+        pwm.cycleStart = now;
+        pwm.nextEvent = pwm.cycleStart + pwm.periodTicks;
+        setPinLevel(pins.forwardPin, LOW);
+        setPinLevel(pins.reversePin, LOW);
     }
 }
 
@@ -307,11 +322,11 @@ void applyOutput(size_t index, int16_t command, bool outputsEnabled, bool brake)
             setPinLevel(state.pins.forwardPin, LOW);
             setPinLevel(state.pins.reversePin, LOW);
         } else {
-            pwm.onTicks = onTicks;
-            pwm.activePin =
-                (filteredCommand > 0) ? kActiveForward : kActiveReverse;
-            // Always drop both lines before setting the active one to avoid shoot-through
-            setPinLevel(state.pins.forwardPin, LOW);
+    pwm.onTicks = onTicks;
+    pwm.activePin =
+        (filteredCommand > 0) ? kActiveForward : kActiveReverse;
+    // Always drop both lines before setting the active one to avoid shoot-through
+    setPinLevel(state.pins.forwardPin, LOW);
             setPinLevel(state.pins.reversePin, LOW);
             pwm.nextEvent = currentTicks;
             setAlarmIntervalLocked(1);
@@ -470,37 +485,41 @@ void update(bool enabled, bool brake, Outputs &current, const Outputs &target) {
         lf = lr = rf = rr = 0;
     }
 
-    // Time-aware slew limiting to avoid sudden changes; guarantee <=0.5s to reach new target
-    uint64_t nowMicros = micros();
-    uint32_t dtMicros = kFallbackDtMicros;
-    if (lastUpdateMicros != 0 && nowMicros > lastUpdateMicros) {
-        uint64_t delta = nowMicros - lastUpdateMicros;
-        dtMicros = static_cast<uint32_t>(std::min<uint64_t>(delta, kMaxSlewTimeMicros));
+    if (kSlewLimitingEnabled) {
+        // Time-aware slew limiting to avoid sudden changes; guarantee <=0.5s to reach new target
+        uint64_t nowMicros = micros();
+        uint32_t dtMicros = kFallbackDtMicros;
+        if (lastUpdateMicros != 0 && nowMicros > lastUpdateMicros) {
+            uint64_t delta = nowMicros - lastUpdateMicros;
+            dtMicros = static_cast<uint32_t>(std::min<uint64_t>(delta, kMaxSlewTimeMicros));
+        }
+        lastUpdateMicros = nowMicros;
+
+        auto slewChannel = [&](int16_t previousValue, int16_t desired) -> int16_t {
+            int32_t delta = static_cast<int32_t>(desired) - static_cast<int32_t>(previousValue);
+            if (delta == 0) {
+                return previousValue;
+            }
+            uint32_t mag = static_cast<uint32_t>(delta > 0 ? delta : -delta);
+            // step = ceil(mag * dt / maxTime)
+            uint32_t numer = mag * dtMicros + (kMaxSlewTimeMicros - 1);
+            uint32_t step = numer / kMaxSlewTimeMicros;
+            if (step == 0) {
+                step = 1;
+            }
+            if (step > mag) {
+                step = mag;
+            }
+            return static_cast<int16_t>(previousValue + (delta > 0 ? static_cast<int32_t>(step) : -static_cast<int32_t>(step)));
+        };
+
+        lf = slewChannel(previous.leftFront, lf);
+        lr = slewChannel(previous.leftRear, lr);
+        rf = slewChannel(previous.rightFront, rf);
+        rr = slewChannel(previous.rightRear, rr);
+    } else {
+        lastUpdateMicros = micros();
     }
-    lastUpdateMicros = nowMicros;
-
-    auto slewChannel = [&](int16_t previousValue, int16_t desired) -> int16_t {
-        int32_t delta = static_cast<int32_t>(desired) - static_cast<int32_t>(previousValue);
-        if (delta == 0) {
-            return previousValue;
-        }
-        uint32_t mag = static_cast<uint32_t>(delta > 0 ? delta : -delta);
-        // step = ceil(mag * dt / maxTime)
-        uint32_t numer = mag * dtMicros + (kMaxSlewTimeMicros - 1);
-        uint32_t step = numer / kMaxSlewTimeMicros;
-        if (step == 0) {
-            step = 1;
-        }
-        if (step > mag) {
-            step = mag;
-        }
-        return static_cast<int16_t>(previousValue + (delta > 0 ? static_cast<int32_t>(step) : -static_cast<int32_t>(step)));
-    };
-
-    lf = slewChannel(previous.leftFront, lf);
-    lr = slewChannel(previous.leftRear, lr);
-    rf = slewChannel(previous.rightFront, rf);
-    rr = slewChannel(previous.rightRear, rr);
 
     applyOutput(0, lf, outputsEnabled, brake);
     applyOutput(1, lr, outputsEnabled, brake);

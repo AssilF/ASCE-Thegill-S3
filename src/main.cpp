@@ -40,15 +40,18 @@ const ShiftRegister::Pins SHIFT_REG_PINS = {
     config::kShiftRegisterLatchPin
 };
 const uint32_t CPU_FREQ_MHZ = 240;
-const uint16_t FAST_TASK_STACK = 4096;
-const uint16_t COMM_TASK_STACK = 8192;
-const uint16_t FAILSAFE_TASK_STACK = 2048;
-const uint16_t TELEMETRY_TASK_STACK = 4096;
-const uint16_t OTA_TASK_STACK = 4096; // bump to avoid stack canary in OTATask
-const uint16_t BUZZER_TASK_STACK = 1024;
-const uint16_t STATUS_LED_TASK_STACK = 3072; // bump to avoid stack canary trips in StatusLED task
+const uint16_t FAST_TASK_STACK = 6144;
+const uint16_t COMM_TASK_STACK = 12288;
+const uint16_t FAILSAFE_TASK_STACK = 4096;
+const uint16_t TELEMETRY_TASK_STACK = 6144;
+const uint16_t OTA_TASK_STACK = 6144; // bump to avoid stack canary in OTATask
+const uint16_t BUZZER_TASK_STACK = 2048;
+const uint16_t STATUS_LED_TASK_STACK = 4096; // bump to avoid stack canary trips in StatusLED task
 #define CREATE_TASK(fn, name, stack, prio, handle, core) xTaskCreatePinnedToCore(fn, name, stack, NULL, prio, handle, core)
 
+// Task watchdog control
+constexpr bool kEnableTaskWatchdog = true; // Enable task watchdog to catch stalls
+constexpr uint32_t kTaskWatchdogTimeoutSeconds = 8;
 
 const int STATUS_LED_PIN = config::kStatusLedPin;
 constexpr auto SR_STATUS_LED_PRIMARY = ShiftRegister::Output::SystemIndicatorLed;
@@ -94,6 +97,7 @@ static void forceArmOutputsIfNeeded();
 static void setDefaultArmPose();
 static void setGripperTarget(std::size_t index, GripperDirection direction);
 static void applyGripperOutputs();
+static void configureTaskWatchdog();
 
 // Task handles for watchdog tracking
 static TaskHandle_t gFastTaskHandle = nullptr;
@@ -482,13 +486,10 @@ static void applyConfigurationPacket(const ConfigurationPacket &packet)
     // Keep drivetrain armed regardless of incoming control flag
     isArmed = true;
 
-    bool manipEnabled = (packet.controlFlags & ConfigFlag::ArmOutputsEnable) != 0;
-    if (armControlEnabled != manipEnabled)
-    {
-        armControlEnabled = manipEnabled;
-        ArmControl::setOutputsEnabled(armControlEnabled);
-        ArmServos::setEnabled(armControlEnabled);
-    }
+    // Keep arm outputs and servos enabled regardless of incoming config flags
+    armControlEnabled = true;
+    ArmControl::setOutputsEnabled(true);
+    ArmServos::setEnabled(true);
     forceArmOutputsIfNeeded();
 
     failsafe_enable = (packet.controlFlags & ConfigFlag::FailsafeEnable) != 0;
@@ -551,6 +552,7 @@ static void updateDynamicLeds(uint32_t nowMs, bool brakeActive, const Motor::Out
 
     static bool lastMoving = false;
     static uint32_t brakeHoldUntilMs = 0;
+    static uint32_t lastSpeedMag = 0;
 
     auto abs16 = [](int16_t v) -> int16_t { return v < 0 ? static_cast<int16_t>(-v) : v; };
     auto scaleDuty = [](int16_t counts) -> uint8_t {
@@ -563,7 +565,8 @@ static void updateDynamicLeds(uint32_t nowMs, bool brakeActive, const Motor::Out
 
     const int16_t leftMag = std::max(abs16(current.leftFront), abs16(current.leftRear));
     const int16_t rightMag = std::max(abs16(current.rightFront), abs16(current.rightRear));
-    const bool moving = (leftMag > 0) || (rightMag > 0);
+    const uint32_t speedMag = static_cast<uint32_t>(std::max(leftMag, rightMag));
+    const bool moving = speedMag > 0;
 
     uint8_t led0 = 0;
     uint8_t led1 = 0;
@@ -574,17 +577,21 @@ static void updateDynamicLeds(uint32_t nowMs, bool brakeActive, const Motor::Out
         led0 = scaleDuty(leftMag);
         led2 = scaleDuty(rightMag);
         brakeHoldUntilMs = 0;
+        lastSpeedMag = speedMag;
     }
     else
     {
-        if (lastMoving || brakeActive)
+        // Trigger brake lamp on stop or sharp decel
+        const bool decel = lastMoving && (lastSpeedMag > 50); // simple threshold on prior speed
+        if (decel || brakeActive)
         {
-            brakeHoldUntilMs = nowMs + 1000;
+            brakeHoldUntilMs = nowMs + 800; // brief on after stop/decel
         }
         if (brakeHoldUntilMs != 0 && nowMs <= brakeHoldUntilMs)
         {
             led1 = 255;
         }
+        lastSpeedMag = 0;
     }
 
     lastMoving = moving;
@@ -656,6 +663,15 @@ static void applyArmControlCommand(const ArmControlCommand &packet, uint32_t tim
     else if (requestDisableServos && !requestEnableServos)
     {
         ArmServos::setEnabled(false);
+    }
+
+    // If we receive any arm command and there was no explicit disable, make sure outputs are on
+    if (!requestDisableOutputs) {
+        armControlEnabled = true;
+        ArmControl::setOutputsEnabled(true);
+    }
+    if (!requestDisableServos) {
+        ArmServos::setEnabled(true);
     }
 
     if (packet.validMask & ArmCommandMask::Extension)
@@ -920,6 +936,25 @@ static void runLedSelfTest()
     syncPeripheralOutputs();
 }
 
+static void runPumpSelfTest()
+{
+    Serial.println("[SelfTest] Pump ramp");
+    PeripheralState previous = gPeripheralState;
+    gPeripheralState.pumpDuty = 0;
+    syncPeripheralOutputs();
+
+    for (int duty = 0; duty <= 255; duty += 25) {
+        gPeripheralState.pumpDuty = static_cast<uint8_t>(duty);
+        syncPeripheralOutputs();
+        delay(80);
+    }
+
+    gPeripheralState.pumpDuty = 0;
+    syncPeripheralOutputs();
+    gPeripheralState = previous;
+    syncPeripheralOutputs();
+}
+
 static void runRgbHueLoopTick(uint32_t nowMs)
 {
     if (!kUseOnboardRgb)
@@ -936,7 +971,7 @@ static void runRgbHueLoopTick(uint32_t nowMs)
 static void runPowerOnSelfTest()
 {
     Serial.println("=== Power-on self-test ===");
-    runLedSelfTest();
+    // Startup self-tests disabled to avoid actuation at boot
     Serial.println("=== Self-test complete ===");
 }
 
@@ -1305,16 +1340,31 @@ void CommTask(void *pvParameters) {
         Comms::loop();
 
         Comms::LinkStatus status = Comms::getLinkStatus();
+        bool peerChanged = false;
         if (status.paired) {
-            bool peerChanged = !lastPaired || !Comms::macEqual(status.peerMac, lastPeerMac);
+            peerChanged = !lastPaired || !Comms::macEqual(status.peerMac, lastPeerMac);
             if (peerChanged) {
                 memcpy(lastPeerMac, status.peerMac, sizeof(lastPeerMac));
                 if (BUZZER_PIN >= 0) {
                     beep(2000, 200);
                 }
             }
-        } else {
+        } else if (lastPaired) {
+            // Lost pairing after previously being paired: force safe outputs once
             memset(lastPeerMac, 0, sizeof(lastPeerMac));
+            clearPeripheralState();
+            ThegillCommand safe{};
+            safe.magic = THEGILL_PACKET_MAGIC;
+            safe.flags = GILL_FLAG_BRAKE;
+            storeCommandSnapshot(safe);
+            targetOutputs = {0, 0, 0, 0};
+            resetDriveEasing(targetOutputs);
+            Motor::update(false, true, currentOutputs, targetOutputs);
+            if (!kForceArmOutputsEnabled) {
+                armControlEnabled = false;
+                ArmControl::setOutputsEnabled(false);
+                ArmServos::setEnabled(false);
+            }
         }
         lastPaired = status.paired;
 
@@ -1404,6 +1454,29 @@ static void SRShutdownHandler() {
     Motor::stop();
 }
 
+// Enable or fully disable the task watchdog depending on the compile-time flag
+static void configureTaskWatchdog()
+{
+    gWdtReady = false;
+    if (!kEnableTaskWatchdog) {
+        esp_task_wdt_deinit();
+        Serial.println("Task watchdog disabled");
+        return;
+    }
+
+    esp_err_t err = esp_task_wdt_init(kTaskWatchdogTimeoutSeconds, true);
+    if (err == ESP_OK) {
+        gWdtReady = true;
+        // Remove idle tasks from monitoring to avoid false trips when Wi-Fi stack hogs core 0
+        TaskHandle_t idle0 = xTaskGetIdleTaskHandleForCPU(0);
+        TaskHandle_t idle1 = xTaskGetIdleTaskHandleForCPU(1);
+        if (idle0) esp_task_wdt_delete(idle0);
+        if (idle1) esp_task_wdt_delete(idle1);
+    } else {
+        Serial.printf("Task watchdog init failed (%d); running without it\n", static_cast<int>(err));
+    }
+}
+
 
 void setup()
 {
@@ -1436,6 +1509,7 @@ void setup()
         gOnboardPixel.setBrightness(64);
         gOnboardPixel.clear();
         gOnboardPixel.show();
+        yield(); // Allow system tasks to run during init bursts
     }
 
     if (!ShiftRegister::init(
@@ -1461,19 +1535,25 @@ void setup()
         Serial.println("Analog input subsystem init failed");
     }
 
-    if (PcintEncoder::initDefault()) {
-        Serial.printf("Wheel encoder subsystem ready (%u channels)\n",
-                      static_cast<unsigned>(PcintEncoder::encoderCount()));
+    if (config::kEnableEncoders) {
+        if (PcintEncoder::initDefault()) {
+            Serial.printf("Wheel encoder subsystem ready (%u channels)\n",
+                          static_cast<unsigned>(PcintEncoder::encoderCount()));
+        } else {
+            Serial.println("Wheel encoder subsystem skipped (no valid PCINT pins)");
+        }
     } else {
-        Serial.println("Wheel encoder subsystem skipped (no valid PCINT pins)");
+        Serial.println("Wheel encoder subsystem disabled by configuration");
     }
 
-    ArmControl::init();
-    ArmControl::setOutputsEnabled(armControlEnabled);
-    ArmServos::init();
-    ArmServos::setEnabled(armControlEnabled);
-    setDefaultArmPose();
-    forceArmOutputsIfNeeded();
+ArmControl::init();
+armControlEnabled = true;
+ArmControl::setOutputsEnabled(true);
+ArmServos::init();
+ArmServos::setEnabled(true);
+// Center servos at boot to confirm wiring
+setDefaultArmPose();
+forceArmOutputsIfNeeded();
 
     setCpuFrequencyMhz(CPU_FREQ_MHZ);
 
@@ -1498,10 +1578,7 @@ void setup()
     Serial.println(Comms::macToString(selfIdentity.mac));
     Serial.println("OTA service started");
 
-    // Configure a watchdog to recover from task hangs
-    if (esp_task_wdt_init(4, true) == ESP_OK) {
-        gWdtReady = true;
-    }
+    configureTaskWatchdog();
 
     // Initialize motor outputs
     if (!Motor::init(PINS_LEFT_FRONT, PINS_LEFT_REAR, PINS_RIGHT_FRONT, PINS_RIGHT_REAR)) {
@@ -1513,7 +1590,7 @@ void setup()
     }
 
     Motor::calibrate();
-    runPowerOnSelfTest();
+    // runPowerOnSelfTest();
     // ensure motors are disarmed after calibration
     ThegillCommand initialCommand = loadCommandSnapshot();
     initialCommand.leftFront = 0;
@@ -1571,7 +1648,7 @@ void setup()
         TELEMETRY_TASK_STACK,
         2,
         &gTelemetryTaskHandle,
-        0
+        1 // keep Wi-Fi core (0) free by running telemetry on core 1
     );
 
     CREATE_TASK(

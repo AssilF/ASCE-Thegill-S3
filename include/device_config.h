@@ -35,10 +35,11 @@ constexpr float kMotorCommandDeadband = 0.01f;
 constexpr float kMotorFrequencyThresholdLow = 0.05f;
 constexpr float kMotorFrequencyThresholdMidLow = 0.2f;
 constexpr float kMotorFrequencyThresholdMidHigh = 0.5f;
-constexpr uint32_t kMotorPwmFrequencyLow = 6000;
-constexpr uint32_t kMotorPwmFrequencyMidLow = 10000;
-constexpr uint32_t kMotorPwmFrequencyMidHigh = 16000;
-constexpr uint32_t kMotorPwmFrequencyHigh = 22000;
+// Motor PWM frequency (software PWM); adjusted per testing
+constexpr uint32_t kMotorPwmFrequencyLow = 540;
+constexpr uint32_t kMotorPwmFrequencyMidLow = 540;
+constexpr uint32_t kMotorPwmFrequencyMidHigh = 540;
+constexpr uint32_t kMotorPwmFrequencyHigh = 540;
 constexpr bool kMotorDynamicPwmEnabledDefault = false;
 constexpr uint32_t kMotorPwmFixedFrequency = kMotorPwmFrequencyHigh;
 
@@ -58,6 +59,8 @@ constexpr EncoderPinConfig kEncoderPins[kEncoderCount] = {
     {9,  kInvalidPin, false, true},  // Rear right encoder  (GPIO9)
 };
 
+constexpr bool kEnableEncoders = false; // Disable encoder interrupts by default to reduce ISR load
+
 constexpr float kWheelDiameterCm = 10.0f;
 constexpr float kWheelCircumferenceMeters = (kWheelDiameterCm / 100.0f) * kPi;
 constexpr float kEncoderPinionToWheelRatio = 0.5f * 0.5f * 0.5f; // wheel rev per pinion rev (1/8)
@@ -69,7 +72,8 @@ constexpr float kMetersPerEncoderTick =
               static_cast<float>(kEncoderPulsesPerPinionRev);
 
 constexpr uint8_t kBuzzerPin = 11;
-constexpr uint8_t kBuzzerChannel = 5;
+// Use a channel that does not share a timer with servo channels to avoid LEDC timer conflicts
+constexpr uint8_t kBuzzerChannel = 7;
 constexpr uint8_t kBuzzerResolutionBits = 10;
 constexpr uint8_t kBuzzerMinResolutionBits = 4;
 
@@ -87,8 +91,9 @@ constexpr uint8_t kShiftRegisterDataPin = 21;  // SR SER
 constexpr uint8_t kShiftRegisterClockPin = 36; // SR SRCLK (SCK)
 constexpr uint8_t kShiftRegisterLatchPin = 35; // SR RCLK  (Latch)
 // Higher refresh rate improves apparent PWM frequency: fPWM ~ refresh / (2^resolution)
-constexpr uint32_t kShiftRegisterPwmFrequencyHz = 40000; // 40 kHz refresh
-constexpr uint8_t kShiftRegisterPwmResolutionBits = 7;   // 7-bit dither (~313 Hz effective)
+// Restored original faster refresh for LEDs
+constexpr uint32_t kShiftRegisterPwmFrequencyHz = 20000; // 20 kHz refresh
+constexpr uint8_t kShiftRegisterPwmResolutionBits = 8;   // 8-bit dither (~78 Hz effective)
 
 constexpr uint8_t kArmBasePotPin = 1;
 constexpr uint8_t kArmExtensionPotPin = 2;
@@ -112,7 +117,7 @@ namespace arm {
 constexpr uint16_t kBaseAdcMin = 0;
 constexpr uint16_t kBaseAdcMax = 4095;
 constexpr bool kBaseInvertFeedback = false;
-constexpr bool kBaseInvertDirection = false;
+constexpr bool kBaseInvertDirection = true;
 constexpr float kBaseMaxDegrees = 360.0f;
 
 constexpr uint16_t kExtensionAdcMin = 0;

@@ -213,34 +213,7 @@ void updateAxis(AxisState &axis, float dtSeconds) {
                    axis.config.kd * derivative;
 
     axis.effort = clampf(effort, -config::arm::kOutputLimit, config::arm::kOutputLimit);
-
-    float delta = hadHistory ? (axis.filteredPosition - previousFiltered) : 0.0f;
-    float commanded = axis.effort * static_cast<float>(axis.directionSign);
-    bool commandActive = gOutputsEnabled && std::fabs(commanded) >= config::arm::kDeadband;
-
-    if (commandActive && hadHistory) {
-        if (std::fabs(delta) >= config::arm::kDirectionCheckThreshold) {
-            if (delta * commanded < 0.0f) {
-                if (axis.directionMismatchCount < 255) {
-                    axis.directionMismatchCount++;
-                }
-            } else if (axis.directionMismatchCount > 0) {
-                axis.directionMismatchCount--;
-            }
-        } else if (axis.directionMismatchCount > 0) {
-            axis.directionMismatchCount--;
-        }
-
-        if (axis.directionMismatchCount >= config::arm::kDirectionMismatchLimit) {
-            axis.directionMismatchCount = 0;
-            axis.directionSign *= -1;
-            axis.config.invertDirection = !axis.config.invertDirection;
-            axis.integral = 0.0f;
-            axis.lastError = axis.target - axis.filteredPosition;
-        }
-    } else {
-        axis.directionMismatchCount = 0;
-    }
+    axis.directionMismatchCount = 0; // Auto direction determination disabled
 }
 
 AxisStatus buildAxisStatus(const AxisState &axis) {

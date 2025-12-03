@@ -163,7 +163,7 @@ bool init(const PinConfig *configs, std::size_t count) {
     detachAll();
     g_encoderCount = 0;
     g_configured = false;
-    g_enabled = false;
+    g_enabled = false; // disabled by default to avoid extra ISR load unless explicitly enabled
 
     if (!configs || count == 0) {
         return false;
